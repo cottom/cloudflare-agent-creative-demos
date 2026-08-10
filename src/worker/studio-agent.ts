@@ -6,7 +6,9 @@ import type {
   CanvasCommand,
   CanvasNode,
   CanvasVariantsWorkflowParams,
+  ChatMessage,
   EditorAwareness,
+  JsonObject,
   PptBuildWorkflowParams,
   PptCommand,
   ProjectCommand,
@@ -30,12 +32,25 @@ import {
   writeWorkspaceFile
 } from "./lib/project-access";
 
-function textFromMessage(message: UIMessage): string {
-  return message.parts
-    .map((part) => part.type === "text" && "text" in part ? String(part.text) : "")
-    .filter(Boolean)
-    .join("\n");
+/**
+ * `UIMessage` carries `metadata?: unknown`, which fails the Workers RPC
+ * `Serializable` check and silently collapses callers to `never`. Project the
+ * message onto the JSON-safe subset the UI actually renders.
+ */
+function toChatMessage(message: UIMessage): ChatMessage {
+  return {
+    id: message.id,
+    role: message.role,
+    parts: message.parts.map((part) => ({
+      type: part.type,
+      ...("text" in part && typeof part.text === "string" ? { text: part.text } : {})
+    }))
+  };
 }
+
+const MAX_MUTATION_ATTEMPTS = 4;
+/** Per-attempt delay in ms; index 0 is unused because the first try is immediate. */
+const BACKOFF_MS = [0, 25, 75, 200];
 
 export function studioAgentName(kind: ProjectKind, projectId: string, sessionId: string): string {
   return `${kind}--${projectId}--${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 180);
@@ -129,8 +144,8 @@ export class StudioAgent extends Think<Env> {
     return readProject(this.env, config.kind, config.projectId);
   }
 
-  async getConversation(): Promise<UIMessage[]> {
-    return this.getMessages();
+  async getConversation(): Promise<ChatMessage[]> {
+    return (await this.getMessages()).map(toChatMessage);
   }
 
   async sendUserMessage(text: string, awareness?: EditorAwareness) {
@@ -157,21 +172,14 @@ export class StudioAgent extends Think<Env> {
     );
 
     return {
-      submission,
+      submissionId: messageId,
+      accepted: submission.accepted,
       messages: await this.getConversation()
     };
   }
 
   async clearConversation(): Promise<void> {
     await this.clearMessages();
-  }
-
-  async conversationSummary(): Promise<Array<{ id: string; role: string; text: string }>> {
-    return (await this.getMessages()).map((message) => ({
-      id: message.id,
-      role: message.role,
-      text: textFromMessage(message)
-    }));
   }
 
   private async applyCommands(
@@ -183,7 +191,13 @@ export class StudioAgent extends Think<Env> {
   ) {
     const config = this.requireConfig();
     const commandId = `${actorType}-${workflowId ?? config.sessionId}-${operationId ?? crypto.randomUUID()}`;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    let lastRevision = -1;
+    for (let attempt = 0; attempt < MAX_MUTATION_ATTEMPTS; attempt += 1) {
+      // Retries are immediate on the first pass, then backed off. Without this,
+      // four attempts can burn through inside a few milliseconds while a user
+      // drag or a sibling workflow step is still committing — losing the edit
+      // to a conflict that would have cleared on its own.
+      if (attempt > 0) await scheduler.wait(BACKOFF_MS[attempt] ?? 200);
       const state = await readProject(this.env, config.kind, config.projectId);
       const result = await applyProjectMutation(this.env, config.kind, config.projectId, {
         commandId,
@@ -196,8 +210,12 @@ export class StudioAgent extends Think<Env> {
         await syncProjectWorkspace(this.env, result.state);
         return result.state;
       }
+      lastRevision = result.currentRevision;
     }
-    throw new Error("Project changed repeatedly while the Agent was editing; retry the request");
+    throw new Error(
+      `Project changed repeatedly while the Agent was editing (latest revision ${lastRevision} ` +
+      `after ${MAX_MUTATION_ATTEMPTS} attempts); retry the request`
+    );
   }
 
   async applyWorkflowCommands(
@@ -215,7 +233,7 @@ export class StudioAgent extends Think<Env> {
     return stub.createInteraction(interaction);
   }
 
-  async resolveInteraction(interactionId: string, response: Record<string, unknown>): Promise<ProjectInteraction> {
+  async resolveInteraction(interactionId: string, response: JsonObject): Promise<ProjectInteraction> {
     const config = this.requireConfig();
     const stub = getProjectStub(this.env, config.kind, config.projectId);
     const interaction = await stub.getInteraction(interactionId);
@@ -333,7 +351,7 @@ export class StudioAgent extends Think<Env> {
 
   async onWorkflowComplete(workflowName: string, instanceId: string, result?: unknown) {
     await this.recordWorkflow(instanceId, workflowType(workflowName), "complete", 1, "Workflow complete", {
-      result: result && typeof result === "object" ? result as Record<string, unknown> : { value: result }
+      result: result && typeof result === "object" ? result as JsonObject : { value: String(result) }
     });
   }
 

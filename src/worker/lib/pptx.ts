@@ -12,11 +12,9 @@ export async function renderPptx(document: PresentationDocument): Promise<Uint8A
   pptx.company = "Cloudflare Creative Agent Demo";
   pptx.subject = document.objective;
   pptx.title = document.title;
-  pptx.lang = "zh-CN";
   pptx.theme = {
     headFontFace: document.theme.fontFamily,
-    bodyFontFace: document.theme.fontFamily,
-    lang: "zh-CN"
+    bodyFontFace: document.theme.fontFamily
   };
 
   for (const [index, source] of document.slides.entries()) {
@@ -38,7 +36,7 @@ export async function renderPptx(document: PresentationDocument): Promise<Uint8A
       color: normalizeColor(document.theme.foreground),
       breakLine: false,
       margin: 0.03,
-      valign: "mid"
+      valign: "middle"
     });
     if (source.subtitle) {
       slide.addText(source.subtitle, {
@@ -61,7 +59,7 @@ export async function renderPptx(document: PresentationDocument): Promise<Uint8A
       margin: 0.04,
       breakLine: false,
       valign: "top",
-      paraSpaceAfterPt: 14
+      paraSpaceAfter: 14
     });
     slide.addText(document.title, {
       x: 0.7, y: 7.08, w: 5.4, h: 0.2,

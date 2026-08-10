@@ -1,21 +1,28 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ProjectInteraction } from "../../shared/types";
+import type { JsonObject, ProjectInteraction } from "../../shared/types";
 
 type Props = {
   interaction: ProjectInteraction;
   busy?: boolean;
-  onApprove: (response: Record<string, unknown>) => Promise<void>;
+  onApprove: (response: JsonObject) => Promise<void>;
   onReject: (reason: string) => Promise<void>;
 };
 
+/** Narrows a JSON blob field without erasing its JSON-safety for the round trip. */
+function jsonObject(value: unknown) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
 export function InteractionCard({ interaction, busy, onApprove, onReject }: Props) {
-  const plan = interaction.payload.plan as Record<string, unknown> | undefined;
-  const initialTheme = typeof plan?.recommendedTheme === "string" ? plan.recommendedTheme : "midnight";
+  const plan = jsonObject(interaction.payload.plan);
+  const initialTheme = "recommendedTheme" in plan && typeof plan.recommendedTheme === "string"
+    ? plan.recommendedTheme
+    : "midnight";
   const initialDirections = useMemo(() => {
     const raw = interaction.payload.directions;
     if (!Array.isArray(raw)) return [];
     return raw.map((item) => {
-      const value = item as Record<string, unknown>;
+      const value = jsonObject(item) as Record<string, unknown>;
       return {
         title: String(value.title ?? "Creative direction"),
         rationale: String(value.rationale ?? ""),
@@ -35,7 +42,7 @@ export function InteractionCard({ interaction, busy, onApprove, onReject }: Prop
     setSelected([]);
   }, [interaction.id, initialTheme, initialDirections]);
 
-  const planSlides = Array.isArray(plan?.slides) ? plan?.slides as Array<Record<string, unknown>> : [];
+  const planSlides = "slides" in plan && Array.isArray(plan.slides) ? plan.slides : [];
   const choiceOptions = Array.isArray(interaction.payload.options)
     ? interaction.payload.options as Array<Record<string, unknown>>
     : [];
@@ -51,7 +58,7 @@ export function InteractionCard({ interaction, busy, onApprove, onReject }: Prop
       return;
     }
     if (interaction.kind === "choice" || interaction.kind === "multi_select") {
-      await onApprove({ selected: multiple ? selected : selected[0] });
+      await onApprove({ selected: multiple ? selected : selected[0] ?? null });
       return;
     }
     await onApprove({ approved: true });

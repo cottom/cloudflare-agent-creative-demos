@@ -2,15 +2,17 @@ import { getAgentByName, routeAgentRequest } from "agents";
 import type {
   CanvasVariantsWorkflowParams,
   EditorAwareness,
+  JsonObject,
   PptBuildWorkflowParams,
   ProjectKind,
   ProjectMutation,
   ProjectState,
-  SessionMeta,
   StudioAgentConfig
 } from "../shared/types";
 import { getProjectStub, listWorkspace, readProject, syncProjectWorkspace } from "./lib/project-access";
+import { DEFAULT_IMAGE_MODEL, DEFAULT_LLM_MODEL } from "./lib/ai";
 import { savePresentationExport } from "./lib/artifacts";
+import { isServableArtifactKey } from "../shared/policy";
 import { StudioAgent, studioAgentName } from "./studio-agent";
 
 export { PptProject, CanvasProject } from "./project/project-do";
@@ -36,7 +38,11 @@ function json(data: unknown, status = 200, headers?: HeadersInit): Response {
 async function readJson<T>(request: Request): Promise<T> {
   const type = request.headers.get("content-type") ?? "";
   if (!type.includes("application/json")) throw new HttpError(415, "Expected application/json");
-  return request.json() as Promise<T>;
+  try {
+    return await request.json() as T;
+  } catch {
+    throw new HttpError(400, "Malformed JSON body");
+  }
 }
 
 function parseKind(value: string | undefined): ProjectKind {
@@ -67,23 +73,31 @@ async function configureAgent(
 async function bootstrapDemo(env: Env) {
   const pptStub = getProjectStub(env, "ppt", DEMOS.ppt.projectId);
   const canvasStub = getProjectStub(env, "canvas", DEMOS.canvas.projectId);
-  const ppt = await pptStub.initialize(DEMOS.ppt.projectId) as ProjectState;
-  const canvas = await canvasStub.initialize(DEMOS.canvas.projectId) as ProjectState;
   await Promise.all([
-    syncProjectWorkspace(env, ppt),
-    syncProjectWorkspace(env, canvas),
+    pptStub.initialize(DEMOS.ppt.projectId),
+    canvasStub.initialize(DEMOS.canvas.projectId)
+  ]);
+  // Configuring an agent registers its session on the project, so it has to
+  // settle before the mirror is written — otherwise the workspace snapshot
+  // records a state that is missing the very sessions just created.
+  await Promise.all([
     configureAgent(env, "ppt", DEMOS.ppt.projectId, DEMOS.ppt.sessionId, DEMOS.ppt.title),
     configureAgent(env, "canvas", DEMOS.canvas.projectId, DEMOS.canvas.sessionId, DEMOS.canvas.title)
   ]);
+  const [ppt, canvas] = await Promise.all([
+    readProject(env, "ppt", DEMOS.ppt.projectId),
+    readProject(env, "canvas", DEMOS.canvas.projectId)
+  ]);
+  await Promise.all([
+    syncProjectWorkspace(env, ppt),
+    syncProjectWorkspace(env, canvas)
+  ]);
   return {
-    projects: {
-      ppt: await readProject(env, "ppt", DEMOS.ppt.projectId),
-      canvas: await readProject(env, "canvas", DEMOS.canvas.projectId)
-    },
+    projects: { ppt, canvas },
     defaults: DEMOS,
     models: {
-      llm: (env as Env & { LLM_MODEL?: string }).LLM_MODEL ?? "@cf/moonshotai/kimi-k2.6",
-      image: (env as Env & { IMAGE_MODEL?: string }).IMAGE_MODEL ?? "@cf/black-forest-labs/flux-1-schnell"
+      llm: env.LLM_MODEL ?? DEFAULT_LLM_MODEL,
+      image: env.IMAGE_MODEL ?? DEFAULT_IMAGE_MODEL
     }
   };
 }
@@ -103,14 +117,22 @@ async function handleApi(request: Request, env: Env): Promise<Response | null> {
   if (method === "GET" && url.pathname === "/api/artifacts") {
     const key = url.searchParams.get("key");
     if (!key) throw new HttpError(400, "Missing artifact key");
-    const object = await env.ARTIFACTS.get(key);
+    if (!isServableArtifactKey(key)) throw new HttpError(400, "Invalid artifact key");
+    // Conditional GET: R2 omits the body when the precondition fails, so an
+    // unchanged artifact costs a metadata lookup instead of a full transfer.
+    const object = await env.ARTIFACTS.get(key, { onlyIf: request.headers });
     if (!object) throw new HttpError(404, "Artifact not found");
     const headers = new Headers();
     object.writeHttpMetadata(headers);
     headers.set("etag", object.httpEtag);
-    headers.set("cache-control", "private, max-age=300");
+    // Artifact keys embed the revision or workflow id, so a key's bytes never change.
+    headers.set("cache-control", "public, max-age=31536000, immutable");
     if (url.searchParams.get("download") === "1") {
-      headers.set("content-disposition", `attachment; filename="${key.split("/").at(-1) ?? "artifact"}"`);
+      const filename = (key.split("/").at(-1) ?? "artifact").replace(/["\\\r\n]/g, "");
+      headers.set("content-disposition", `attachment; filename="${filename}"`);
+    }
+    if (!("body" in object)) {
+      return new Response(null, { status: request.headers.has("if-none-match") ? 304 : 412, headers });
     }
     return new Response(object.body, { headers });
   }
@@ -123,6 +145,12 @@ async function handleApi(request: Request, env: Env): Promise<Response | null> {
     await projectStub.initialize(projectId);
 
     if (parts.length === 4 && method === "GET") {
+      // Pollers pass ?since=<revision>; skip the full payload when unchanged.
+      const since = Number(url.searchParams.get("since"));
+      if (Number.isInteger(since)) {
+        const revision = await projectStub.getRevision();
+        if (revision === since) return json({ unchanged: true, revision });
+      }
       return json(await projectStub.getSnapshot());
     }
     if (parts.length === 5 && parts[4] === "mutate" && method === "POST") {
@@ -184,7 +212,7 @@ async function handleApi(request: Request, env: Env): Promise<Response | null> {
         return json(await agent.startCanvasVariantsWorkflow(body), 202);
       }
       if (parts[6] === "interactions" && parts[7] && parts[8] === "resolve" && method === "POST") {
-        const body = await readJson<{ response: Record<string, unknown> }>(request);
+        const body = await readJson<{ response: JsonObject }>(request);
         return json(await agent.resolveInteraction(decodeURIComponent(parts[7]), body.response));
       }
       if (parts[6] === "interactions" && parts[7] && parts[8] === "reject" && method === "POST") {
@@ -208,10 +236,11 @@ export default {
 
       return env.ASSETS.fetch(request);
     } catch (error) {
-      const status = error instanceof HttpError ? error.status : 500;
-      const message = error instanceof Error ? error.message : String(error);
       console.error(error);
-      return json({ error: message }, status);
+      // Only deliberate HTTP errors carry a caller-facing message; anything
+      // else is an internal fault and its text is not echoed back.
+      if (error instanceof HttpError) return json({ error: error.message }, error.status);
+      return json({ error: "Internal error" }, 500);
     }
   }
 } satisfies ExportedHandler<Env>;

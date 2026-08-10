@@ -3,6 +3,7 @@ import type {
   CanvasCommand,
   CanvasProjectState,
   EditorAwareness,
+  JsonObject,
   PptCommand,
   PptProjectState,
   ProjectCommand,
@@ -70,7 +71,8 @@ export default function App() {
 
   usePolling(async () => {
     if (!activeProject || busy) return;
-    const next = await api.getProject(activeKind, activeProject.id);
+    const next = await api.getProjectSince(activeKind, activeProject.id, activeProject.revision);
+    if ("unchanged" in next) return;
     setProjects((existing) => existing ? { ...existing, [activeKind]: next } as ProjectMap : existing);
   }, 1600, Boolean(activeProject));
 
@@ -136,7 +138,7 @@ export default function App() {
     });
   };
 
-  const resolveInteraction = async (sessionId: string, interactionId: string, response: Record<string, unknown>) => {
+  const resolveInteraction = async (sessionId: string, interactionId: string, response: JsonObject) => {
     if (!activeProject) return;
     await run(async () => {
       await api.resolveInteraction(activeKind, activeProject.id, sessionId, interactionId, response);

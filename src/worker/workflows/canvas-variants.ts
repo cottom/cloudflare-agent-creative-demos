@@ -5,12 +5,16 @@ import type {
   CanvasNode,
   CanvasVariantsWorkflowParams,
   ProjectInteraction,
+  ProjectState,
   WorkflowProgressPayload
 } from "../../shared/types";
 import type { StudioAgent } from "../studio-agent";
 import { generateCanvasDirections, generateImageBytes } from "../lib/ai";
 import { saveCanvasImage } from "../lib/artifacts";
 import { readProject } from "../lib/project-access";
+
+/** Image variants generated in flight at once. */
+const IMAGE_CONCURRENCY = 2;
 
 function stableSeed(value: string): number {
   let hash = 2166136261;
@@ -65,7 +69,10 @@ export class CanvasVariantsWorkflow extends AgentWorkflow<StudioAgent, CanvasVar
       status: "pending",
       createdAt: new Date().toISOString()
     };
-    await step.do("publish-directions-review", async () => this.agent.createWorkflowInteraction(interaction));
+    await step.do(
+      "publish-directions-review",
+      async (): Promise<ProjectInteraction> => this.agent.createWorkflowInteraction(interaction)
+    );
     await this.reportProgress({
       step: "approval", status: "waiting", percent: 0.2,
       message: "Waiting for visual direction approval", interactionId
@@ -96,22 +103,24 @@ export class CanvasVariantsWorkflow extends AgentWorkflow<StudioAgent, CanvasVar
       status: "generating"
     }));
 
-    await step.do("create-canvas-placeholders", async () => this.agent.applyWorkflowCommands(
-      this.workflowId,
-      nodes.map((node): CanvasCommand => ({ type: "canvas.add_node", node })),
-      `Created ${nodes.length} image generation placeholders`,
-      "create-canvas-placeholders"
-    ));
+    await step.do(
+      "create-canvas-placeholders",
+      async (): Promise<ProjectState> => this.agent.applyWorkflowCommands(
+        this.workflowId,
+        nodes.map((node): CanvasCommand => ({ type: "canvas.add_node", node })),
+        `Created ${nodes.length} image generation placeholders`,
+        "create-canvas-placeholders"
+      )
+    );
 
-    for (let index = 0; index < nodes.length; index += 1) {
+    const failedNodeIds: string[] = [];
+    const generatedNodeIds: string[] = [];
+
+    /** Generate one variant. Resolves either way — a failure is recorded, not thrown. */
+    const generateVariant = async (index: number): Promise<void> => {
       const node = nodes[index];
       const direction = directions[index];
-      if (!node || !direction) continue;
-      const percentStart = 0.28 + (index / nodes.length) * 0.58;
-      await this.reportProgress({
-        step: `generate-${index + 1}`, status: "running", percent: percentStart,
-        message: `Generating ${index + 1}/${nodes.length}: ${direction.title}`
-      });
+      if (!node || !direction) return;
       try {
         const saved = await step.do(`generate-and-persist-image-${index + 1}`, {
           retries: { limit: 4, delay: "10 seconds", backoff: "exponential" },
@@ -126,26 +135,68 @@ export class CanvasVariantsWorkflow extends AgentWorkflow<StudioAgent, CanvasVar
           if (current.kind !== "canvas") throw new Error("Project kind mismatch");
           return saveCanvasImage(this.env, current, this.workflowId, node.id, bytes);
         });
-        await step.do(`attach-image-${index + 1}`, async () => this.agent.applyWorkflowCommands(
-          this.workflowId,
-          [{ type: "canvas.set_generated_asset", nodeId: node.id, assetKey: saved.key, prompt: direction.prompt, status: "ready" }],
-          `Attached generated image: ${direction.title}`,
-          `attach-image-${index + 1}`
-        ));
-      } catch (error) {
-        await step.do(`mark-image-error-${index + 1}`, async () => this.agent.applyWorkflowCommands(
-          this.workflowId,
-          [{ type: "canvas.update_node", nodeId: node.id, patch: { status: "error" } }],
-          `Marked failed image generation: ${direction.title}`,
-          `mark-image-error-${index + 1}`
-        ));
-        throw error;
+        await step.do(
+          `attach-image-${index + 1}`,
+          async (): Promise<ProjectState> => this.agent.applyWorkflowCommands(
+            this.workflowId,
+            [{ type: "canvas.set_generated_asset", nodeId: node.id, assetKey: saved.key, prompt: direction.prompt, status: "ready" }],
+            `Attached generated image: ${direction.title}`,
+            `attach-image-${index + 1}`
+          )
+        );
+        generatedNodeIds.push(node.id);
+      } catch {
+        // One bad variant must not cost the user the others: mark this node and
+        // let the remaining directions finish.
+        failedNodeIds.push(node.id);
+        await step.do(
+          `mark-image-error-${index + 1}`,
+          async (): Promise<ProjectState> => this.agent.applyWorkflowCommands(
+            this.workflowId,
+            [{ type: "canvas.update_node", nodeId: node.id, patch: { status: "error" } }],
+            `Marked failed image generation: ${direction.title}`,
+            `mark-image-error-${index + 1}`
+          )
+        ).catch(() => undefined);
       }
+    };
+
+    // Bounded concurrency: enough to cut wall-clock time meaningfully without
+    // bursting Workers AI, and it keeps at most IMAGE_CONCURRENCY writers
+    // competing for the project revision at a time.
+    for (let start = 0; start < nodes.length; start += IMAGE_CONCURRENCY) {
+      const batch = nodes.slice(start, start + IMAGE_CONCURRENCY);
+      await this.reportProgress({
+        step: `generate-${start + 1}`,
+        status: "running",
+        percent: 0.28 + (start / nodes.length) * 0.58,
+        message: `Generating ${start + 1}-${start + batch.length} of ${nodes.length}`
+      });
+      await Promise.all(batch.map((_, offset) => generateVariant(start + offset)));
     }
 
-    const finalState = await step.do("read-final-canvas", async () => this.agent.getProjectSnapshot());
-    const result = { projectId: params.projectId, revision: finalState.revision, generatedNodeIds: nodes.map((node) => node.id) };
-    await this.reportProgress({ step: "complete", status: "complete", percent: 1, message: "Canvas variants are ready" });
+    if (!generatedNodeIds.length) {
+      throw new Error(`Every image variant failed to generate (${failedNodeIds.length} attempted)`);
+    }
+
+    const finalState = await step.do(
+      "read-final-canvas",
+      async (): Promise<ProjectState> => this.agent.getProjectSnapshot()
+    );
+    const result = {
+      projectId: params.projectId,
+      revision: finalState.revision,
+      generatedNodeIds,
+      failedNodeIds
+    };
+    await this.reportProgress({
+      step: "complete",
+      status: "complete",
+      percent: 1,
+      message: failedNodeIds.length
+        ? `Canvas variants ready (${generatedNodeIds.length} of ${nodes.length}; ${failedNodeIds.length} failed)`
+        : "Canvas variants are ready"
+    });
     await step.reportComplete(result);
     return result;
   }

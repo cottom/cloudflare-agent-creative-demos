@@ -1,5 +1,5 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
-import type { EditorAwareness, ProjectState, SessionMeta } from "../../shared/types";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import type { EditorAwareness, JsonObject, ProjectState, SessionMeta } from "../../shared/types";
 import type { ClientMessage } from "../lib/api";
 import { messageText } from "../lib/api";
 import { InteractionCard } from "./InteractionCard";
@@ -14,7 +14,7 @@ type Props = {
   onCreateSession: () => Promise<void>;
   onClearSession: () => Promise<void>;
   onSend: (text: string) => Promise<void>;
-  onApproveInteraction: (sessionId: string, interactionId: string, response: Record<string, unknown>) => Promise<void>;
+  onApproveInteraction: (sessionId: string, interactionId: string, response: JsonObject) => Promise<void>;
   onRejectInteraction: (sessionId: string, interactionId: string, reason: string) => Promise<void>;
 };
 

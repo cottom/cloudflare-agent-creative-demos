@@ -1,6 +1,8 @@
 import type {
   CanvasVariantsWorkflowParams,
+  ChatMessage,
   EditorAwareness,
+  JsonObject,
   MutationResult,
   PptBuildWorkflowParams,
   ProjectKind,
@@ -8,11 +10,8 @@ import type {
   ProjectState
 } from "../../shared/types";
 
-export type ClientMessage = {
-  id: string;
-  role: "user" | "assistant" | "system";
-  parts: Array<{ type: string; text?: string; [key: string]: unknown }>;
-};
+/** The wire shape is defined once, in shared/types, and served by the agent. */
+export type ClientMessage = ChatMessage;
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -37,6 +36,12 @@ export const api = {
   getProject: (kind: ProjectKind, projectId: string) =>
     request<ProjectState>(`/api/projects/${kind}/${encodeURIComponent(projectId)}`),
 
+  /** Poll variant: returns `{ unchanged: true }` when the revision has not moved. */
+  getProjectSince: (kind: ProjectKind, projectId: string, since: number) =>
+    request<ProjectState | { unchanged: true; revision: number }>(
+      `/api/projects/${kind}/${encodeURIComponent(projectId)}?since=${since}`
+    ),
+
   mutate: (kind: ProjectKind, projectId: string, mutation: ProjectMutation) =>
     request<MutationResult>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/mutate`, {
       method: "POST",
@@ -59,7 +64,7 @@ export const api = {
     request<{ messages: ClientMessage[] }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/messages`),
 
   sendMessage: (kind: ProjectKind, projectId: string, sessionId: string, text: string, awareness?: EditorAwareness) =>
-    request<{ submission: unknown; messages: ClientMessage[]; project: ProjectState }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    request<{ submissionId: string; accepted: boolean; messages: ClientMessage[]; project: ProjectState }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/messages`, {
       method: "POST",
       body: JSON.stringify({ text, awareness })
     }),
@@ -82,7 +87,7 @@ export const api = {
       body: JSON.stringify(params)
     }),
 
-  resolveInteraction: (kind: ProjectKind, projectId: string, sessionId: string, interactionId: string, response: Record<string, unknown>) =>
+  resolveInteraction: (kind: ProjectKind, projectId: string, sessionId: string, interactionId: string, response: JsonObject) =>
     request(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/interactions/${encodeURIComponent(interactionId)}/resolve`, {
       method: "POST",
       body: JSON.stringify({ response })

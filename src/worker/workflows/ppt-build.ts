@@ -1,6 +1,12 @@
 import { AgentWorkflow } from "agents/workflows";
 import type { AgentWorkflowEvent, AgentWorkflowStep, ApprovalEventPayload } from "agents/workflows";
-import type { PptBuildWorkflowParams, ProjectInteraction, WorkflowProgressPayload } from "../../shared/types";
+import type {
+  ExportArtifact,
+  PptBuildWorkflowParams,
+  ProjectInteraction,
+  ProjectState,
+  WorkflowProgressPayload
+} from "../../shared/types";
 import type { StudioAgent } from "../studio-agent";
 import { generatePptPlan, generatePresentationDocument } from "../lib/ai";
 
@@ -32,7 +38,10 @@ export class PptBuildWorkflow extends AgentWorkflow<StudioAgent, PptBuildWorkflo
       status: "pending",
       createdAt: new Date().toISOString()
     };
-    await step.do("publish-plan-review", async () => this.agent.createWorkflowInteraction(interaction));
+    await step.do(
+      "publish-plan-review",
+      async (): Promise<ProjectInteraction> => this.agent.createWorkflowInteraction(interaction)
+    );
     await this.reportProgress({
       step: "approval", status: "waiting", percent: 0.25,
       message: "Waiting for presentation plan approval", interactionId
@@ -50,18 +59,21 @@ export class PptBuildWorkflow extends AgentWorkflow<StudioAgent, PptBuildWorkflo
       timeout: "8 minutes"
     }, async () => generatePresentationDocument(this.env, params, plan, response));
 
-    const state = await step.do("commit-presentation-project", async () => this.agent.applyWorkflowCommands(
-      this.workflowId,
-      [{ type: "ppt.replace_document", document }],
-      `Workflow rebuilt presentation: ${document.title}`,
-      "commit-presentation-document"
-    ));
+    const state = await step.do(
+      "commit-presentation-project",
+      async (): Promise<ProjectState> => this.agent.applyWorkflowCommands(
+        this.workflowId,
+        [{ type: "ppt.replace_document", document }],
+        `Workflow rebuilt presentation: ${document.title}`,
+        "commit-presentation-document"
+      )
+    );
 
     await this.reportProgress({ step: "export", status: "running", percent: 0.82, message: "Rendering a real PPTX export" });
     const artifact = await step.do("render-pptx-export", {
       retries: { limit: 2, delay: "5 seconds", backoff: "exponential" },
       timeout: "5 minutes"
-    }, async () => this.agent.exportCurrentPpt());
+    }, async (): Promise<ExportArtifact> => this.agent.exportCurrentPpt());
 
     const result = { projectId: params.projectId, revision: state.revision, slideCount: document.slides.length, artifact };
     await this.reportProgress({ step: "complete", status: "complete", percent: 1, message: "Presentation and PPTX are ready" });

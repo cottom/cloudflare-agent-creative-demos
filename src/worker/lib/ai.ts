@@ -12,7 +12,7 @@ export const DEFAULT_LLM_MODEL = "@cf/moonshotai/kimi-k2.6";
 export const DEFAULT_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell";
 
 export function workersLanguageModel(env: Env) {
-  return createWorkersAI({ binding: env.AI })((env as Env & { LLM_MODEL?: string }).LLM_MODEL ?? DEFAULT_LLM_MODEL);
+  return createWorkersAI({ binding: env.AI })(env.LLM_MODEL ?? DEFAULT_LLM_MODEL);
 }
 
 const pptPlanSchema = z.object({
@@ -138,7 +138,7 @@ export async function generateCanvasDirections(
 }
 
 export async function generateImageBytes(env: Env, prompt: string, seed: number): Promise<Uint8Array> {
-  const model = (env as Env & { IMAGE_MODEL?: string }).IMAGE_MODEL ?? DEFAULT_IMAGE_MODEL;
+  const model = env.IMAGE_MODEL ?? DEFAULT_IMAGE_MODEL;
   const response = await env.AI.run(model as Parameters<Ai["run"]>[0], {
     prompt,
     seed,

@@ -15,7 +15,7 @@
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "check": "pnpm types && pnpm typecheck && pnpm test && pnpm build",
     "cf:login": "wrangler login",
     "setup:r2": "wrangler r2 bucket create creative-agent-demo-artifacts",
     "tail": "wrangler tail"
@@ -33,7 +33,7 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.48.0",
-    "@cloudflare/workers-types": "^4.20260616.1",
+    "@types/node": "^26.2.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",

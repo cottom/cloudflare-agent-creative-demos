@@ -1,10 +1,11 @@
-import { withWorkspace } from "@cloudflare/computer";
+import { withWorkspace, type WorkspaceOptions } from "@cloudflare/computer";
 import { DurableObject } from "cloudflare:workers";
 import { applyMutation } from "../../shared/reducers";
 import { createInitialCanvasState, createInitialPptState } from "../../shared/seeds";
 import type {
   CanvasProjectState,
   ExportArtifact,
+  JsonObject,
   MutationResult,
   PptProjectState,
   ProjectInteraction,
@@ -33,6 +34,14 @@ function mutationFingerprint(mutation: ProjectMutation): string {
 abstract class ProjectCore<TState extends ProjectState> extends DurableObject<Env> {
   protected abstract createInitialState(projectId?: string): TState;
 
+  /**
+   * `withWorkspace` needs the DO's storage from outside the class, but `ctx` is
+   * protected on `DurableObject`. This is the one sanctioned seam.
+   */
+  get workspaceStorage(): DurableObjectStorage {
+    return this.ctx.storage;
+  }
+
   async initialize(projectId: string): Promise<TState> {
     const stored = await this.ctx.storage.get<TState>(STATE_KEY);
     if (stored) return structuredClone(stored);
@@ -51,6 +60,14 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
 
   async getSnapshot(): Promise<TState> {
     return structuredClone(await this.ensureState());
+  }
+
+  /**
+   * Cheap change check for pollers: avoids cloning and RPC-serializing the
+   * whole project just to discover nothing moved.
+   */
+  async getRevision(): Promise<number> {
+    return (await this.ensureState()).revision;
   }
 
   async applyMutation(mutation: ProjectMutation): Promise<MutationResult<TState>> {
@@ -127,7 +144,7 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
 
   async resolveInteraction(
     interactionId: string,
-    response: Record<string, unknown>,
+    response: JsonObject,
     status: "resolved" | "cancelled" = "resolved"
   ): Promise<ProjectInteraction> {
     return this.ctx.storage.transaction(async (transaction) => {
@@ -251,5 +268,14 @@ class CanvasProjectCore extends ProjectCore<CanvasProjectState> {
   }
 }
 
-export class PptProject extends withWorkspace(PptProjectCore, (self) => ({ storage: self.ctx.storage })) {}
-export class CanvasProject extends withWorkspace(CanvasProjectCore, (self) => ({ storage: self.ctx.storage })) {}
+/**
+ * `@cloudflare/computer` declares `sql.exec<Row extends object>()` while the
+ * runtime's `SqlStorage` constrains rows to `Record<string, SqlStorageValue>`.
+ * The two are structurally compatible at runtime but not assignable in either
+ * direction, so the storage handle is narrowed at this single seam.
+ */
+const workspaceStorageOf = (self: { workspaceStorage: DurableObjectStorage }) =>
+  ({ storage: self.workspaceStorage as unknown as WorkspaceOptions["storage"] });
+
+export class PptProject extends withWorkspace(PptProjectCore, workspaceStorageOf) {}
+export class CanvasProject extends withWorkspace(CanvasProjectCore, workspaceStorageOf) {}

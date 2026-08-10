@@ -1,5 +1,32 @@
 export type ProjectKind = "ppt" | "canvas";
 
+/**
+ * JSON-safe values. Durable Object RPC type-checks return values against
+ * `Rpc.Serializable`, which rejects `unknown` — so free-form blobs that cross
+ * the RPC boundary must be modelled as JSON rather than `Record<string, unknown>`.
+ *
+ * Nesting is bounded rather than self-referential on purpose: `Serializable<T>`
+ * is itself a recursive mapped type, and composing it with an unbounded JSON
+ * type makes the checker give up with "type instantiation is excessively deep"
+ * (TS2589). Six levels covers the deepest payload on the wire — a plan review's
+ * `payload.plan.slides[].keyPoints[]`.
+ */
+export type JsonPrimitive = string | number | boolean | null;
+type Json0 = JsonPrimitive;
+type Json1 = JsonPrimitive | Json0[] | { [key: string]: Json0 };
+type Json2 = JsonPrimitive | Json1[] | { [key: string]: Json1 };
+type Json3 = JsonPrimitive | Json2[] | { [key: string]: Json2 };
+type Json4 = JsonPrimitive | Json3[] | { [key: string]: Json3 };
+export type JsonValue = JsonPrimitive | Json4[] | { [key: string]: Json4 };
+export type JsonObject = { [key: string]: JsonValue };
+
+/** Serializable projection of an AI SDK `UIMessage` for the RPC/HTTP boundary. */
+export type ChatMessage = {
+  id: string;
+  role: "system" | "user" | "assistant";
+  parts: Array<{ type: string; text?: string }>;
+};
+
 export type ActorRef = {
   type: "user" | "agent" | "workflow" | "system";
   id: string;
@@ -38,9 +65,9 @@ export type ProjectInteraction = {
   kind: InteractionKind;
   title: string;
   description?: string;
-  payload: Record<string, unknown>;
+  payload: JsonObject;
   status: "pending" | "resolved" | "cancelled";
-  response?: Record<string, unknown>;
+  response?: JsonObject;
   createdAt: string;
   resolvedAt?: string;
 };
@@ -53,7 +80,7 @@ export type WorkflowRun = {
   status: "queued" | "running" | "waiting" | "complete" | "error" | "cancelled";
   progress: number;
   message: string;
-  result?: Record<string, unknown>;
+  result?: JsonObject;
   error?: string;
   createdAt: string;
   updatedAt: string;
