@@ -1,0 +1,46 @@
+{
+  "name": "cloudflare-creative-agent-demos",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "vite dev",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "vite build && wrangler deploy",
+    "types": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "cf:login": "wrangler login",
+    "setup:r2": "wrangler r2 bucket create creative-agent-demo-artifacts",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@cloudflare/computer": "0.1.0-alpha.1",
+    "@cloudflare/think": "0.15.1",
+    "agents": "0.20.1",
+    "ai": "^6.0.202",
+    "pptxgenjs": "4.0.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "workers-ai-provider": "^3.3.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.48.0",
+    "@cloudflare/workers-types": "^4.20260616.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.5",
+    "vitest": "^4.1.7",
+    "wrangler": "^4.114.0"
+  },
+  "packageManager": "pnpm@10.15.0"
+}

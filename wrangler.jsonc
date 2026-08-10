@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-creative-agent-demos",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-08-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  "vars": {
+    "LLM_MODEL": "@cf/moonshotai/kimi-k2.6",
+    "IMAGE_MODEL": "@cf/black-forest-labs/flux-1-schnell"
+  },
+  "ai": { "binding": "AI", "remote": true },
+  "r2_buckets": [
+    { "binding": "ARTIFACTS", "bucket_name": "creative-agent-demo-artifacts" }
+  ],
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/agents/*"]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "PPT_PROJECT", "class_name": "PptProject" },
+      { "name": "CANVAS_PROJECT", "class_name": "CanvasProject" },
+      { "name": "STUDIO_AGENT", "class_name": "StudioAgent" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["PptProject", "CanvasProject", "StudioAgent"] }
+  ],
+  "workflows": [
+    { "name": "PPT_BUILD_WORKFLOW", "binding": "PPT_BUILD_WORKFLOW", "class_name": "PptBuildWorkflow" },
+    { "name": "CANVAS_VARIANTS_WORKFLOW", "binding": "CANVAS_VARIANTS_WORKFLOW", "class_name": "CanvasVariantsWorkflow" }
+  ]
+}

@@ -1,0 +1,14 @@
+Cloudflare Creative Agent Demos — delivery validation
+Date: 2026-08-10
+
+PASS  Source syntax parser: 27 TypeScript/TSX files, 0 parse errors.
+PASS  JSON/JSONC configuration parsing.
+PASS  Shared domain smoke: PPT revision 1→2, stale revision rejected, Canvas node committed.
+PASS  Real PptxGenJS smoke: 57,366-byte OOXML/ZIP payload, signature PK.
+PASS  Runtime path audit: no custom mock model, workflow, storage, image, or PPTX provider.
+
+NOT RUN IN ARTIFACT ENVIRONMENT
+- pnpm install / full pnpm check / Vite production build: npm network access was unavailable.
+- wrangler dev/deploy and real Workers AI calls: no Cloudflare account credentials were available.
+
+Required operator verification is documented in docs/VALIDATION.md.

@@ -1,0 +1,3 @@
+# No external provider secrets are required.
+# Model names are configured as Wrangler vars in wrangler.jsonc.
+# Keep this file for future secrets such as auth signing keys.

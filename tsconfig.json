@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "useDefineForClassFields": true,
+    "lib": [
+      "ES2024",
+      "DOM",
+      "DOM.Iterable",
+      "ESNext.Disposable"
+    ],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "types": [
+      "@cloudflare/workers-types",
+      "vite/client"
+    ],
+    "noUncheckedIndexedAccess": true
+  },
+  "include": [
+    "src",
+    "tests",
+    "vite.config.ts",
+    "vitest.config.ts",
+    "worker-configuration.d.ts"
+  ],
+  "exclude": [
+    "dist",
+    "node_modules"
+  ],
+  "extends": "agents/tsconfig"
+}

@@ -1,0 +1,71 @@
+import { AgentWorkflow } from "agents/workflows";
+import type { AgentWorkflowEvent, AgentWorkflowStep, ApprovalEventPayload } from "agents/workflows";
+import type { PptBuildWorkflowParams, ProjectInteraction, WorkflowProgressPayload } from "../../shared/types";
+import type { StudioAgent } from "../studio-agent";
+import { generatePptPlan, generatePresentationDocument } from "../lib/ai";
+
+export class PptBuildWorkflow extends AgentWorkflow<StudioAgent, PptBuildWorkflowParams, WorkflowProgressPayload, Env> {
+  async run(event: AgentWorkflowEvent<PptBuildWorkflowParams>, step: AgentWorkflowStep) {
+    const params = event.payload;
+    await this.reportProgress({ step: "plan", status: "running", percent: 0.05, message: "Creating presentation strategy" });
+
+    const plan = await step.do("generate-presentation-plan", {
+      retries: { limit: 3, delay: "5 seconds", backoff: "exponential" },
+      timeout: "5 minutes"
+    }, async () => generatePptPlan(this.env, params));
+
+    const interactionId = `ppt-plan-${this.workflowId}`;
+    const interaction: ProjectInteraction = {
+      id: interactionId,
+      projectId: params.projectId,
+      sessionId: params.sessionId,
+      workflowId: this.workflowId,
+      source: "workflow",
+      kind: "ppt_plan_review",
+      title: "Review the AI presentation plan",
+      description: "Confirm the narrative and theme before the workflow writes the long-lived presentation asset.",
+      payload: {
+        plan,
+        themeOptions: ["midnight", "editorial", "minimal", "sunrise"],
+        editableFields: ["themeId", "direction", "slides"]
+      },
+      status: "pending",
+      createdAt: new Date().toISOString()
+    };
+    await step.do("publish-plan-review", async () => this.agent.createWorkflowInteraction(interaction));
+    await this.reportProgress({
+      step: "approval", status: "waiting", percent: 0.25,
+      message: "Waiting for presentation plan approval", interactionId
+    });
+
+    const approval = await this.waitForApproval<ApprovalEventPayload>(step, {
+      timeout: "7 days"
+    });
+    if (!approval.approved) throw new Error(approval.reason ?? "Presentation plan was not approved");
+    const response = (approval.metadata?.response as Record<string, unknown> | undefined) ?? {};
+
+    await this.reportProgress({ step: "write", status: "running", percent: 0.35, message: "Writing the approved deck" });
+    const document = await step.do("generate-final-presentation", {
+      retries: { limit: 3, delay: "5 seconds", backoff: "exponential" },
+      timeout: "8 minutes"
+    }, async () => generatePresentationDocument(this.env, params, plan, response));
+
+    const state = await step.do("commit-presentation-project", async () => this.agent.applyWorkflowCommands(
+      this.workflowId,
+      [{ type: "ppt.replace_document", document }],
+      `Workflow rebuilt presentation: ${document.title}`,
+      "commit-presentation-document"
+    ));
+
+    await this.reportProgress({ step: "export", status: "running", percent: 0.82, message: "Rendering a real PPTX export" });
+    const artifact = await step.do("render-pptx-export", {
+      retries: { limit: 2, delay: "5 seconds", backoff: "exponential" },
+      timeout: "5 minutes"
+    }, async () => this.agent.exportCurrentPpt());
+
+    const result = { projectId: params.projectId, revision: state.revision, slideCount: document.slides.length, artifact };
+    await this.reportProgress({ step: "complete", status: "complete", percent: 1, message: "Presentation and PPTX are ready" });
+    await step.reportComplete(result);
+    return result;
+  }
+}
