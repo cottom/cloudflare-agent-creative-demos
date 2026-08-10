@@ -59,27 +59,28 @@ const REVISIONS_DIR = "/project/revisions";
 const revisionPath = (revision: number) => `${REVISIONS_DIR}/${String(revision).padStart(6, "0")}.json`;
 
 /**
- * How many per-revision snapshots to retain in the workspace mirror.
+ * Drop snapshots beyond the retention window.
  *
- * Every mutation writes a full copy of project state here — including each
- * canvas drag — so an unbounded archive grows without limit inside the Durable
- * Object's SQLite storage, and each retained state itself carries up to 100
- * activity entries.
+ * Uses `find` rather than `readdir` for the same reason `listWorkspace` does,
+ * and reports failures instead of swallowing them — a prune that quietly stops
+ * working reintroduces exactly the unbounded growth it exists to prevent.
  */
 async function pruneRevisionHistory(
   workspace: Awaited<ReturnType<typeof openWorkspace>>,
   currentRevision: number
 ): Promise<void> {
   if (currentRevision <= REVISION_HISTORY_LIMIT) return;
-  const entries: Array<{ name: string; isDirectory: boolean }> =
-    await workspace.fs.readdir(REVISIONS_DIR).catch(() => []);
-  const stale = staleRevisionFiles(
-    entries.filter((entry) => !entry.isDirectory).map((entry) => entry.name)
-  );
-  if (!stale.length) return;
-  await Promise.all(
-    stale.map((name) => workspace.fs.rm(`${REVISIONS_DIR}/${name}`).catch(() => undefined))
-  );
+  try {
+    const found: Array<{ path: string; type: "file" | "dir" }> = await workspace.fs.find(REVISIONS_DIR);
+    const names = found
+      .filter((entry) => entry.type === "file")
+      .map((entry) => entry.path.split("/").at(-1) ?? "");
+    const stale = staleRevisionFiles(names);
+    if (!stale.length) return;
+    await Promise.all(stale.map((name) => workspace.fs.rm(`${REVISIONS_DIR}/${name}`)));
+  } catch (error) {
+    console.error("workspace revision prune failed:", error);
+  }
 }
 
 export async function syncProjectWorkspace(env: Env, state: ProjectState): Promise<void> {
@@ -138,21 +139,36 @@ export async function readWorkspaceFile(
 [truncated]` : content;
 }
 
-export async function listWorkspace(env: Env, kind: ProjectKind, projectId: string) {
+export type WorkspaceEntry = { path: string; name: string; isDirectory: boolean };
+
+
+/**
+ * List the whole workspace tree.
+ *
+ * The previous implementation walked directories recursively and ended with
+ * `return walk("/")` — no `await`. A `using` declaration disposes at scope
+ * exit, and returning a pending promise exits the scope immediately, so the
+ * workspace was disposed while the recursion was still running: the initial
+ * `readdir` had already been issued and completed, every nested call hit a
+ * disposed session, and a swallowed `catch` turned that into a silently
+ * truncated listing of exactly one entry.
+ *
+ * `find` returns the entire tree in a single awaited round trip, so there is
+ * no recursion to outlive the session and no per-directory call to lose.
+ */
+export async function listWorkspace(
+  env: Env,
+  kind: ProjectKind,
+  projectId: string
+): Promise<WorkspaceEntry[]> {
   const stub = getProjectStub(env, kind, projectId);
   using workspace = await openWorkspace(stub);
-  const walk = async (path: string, depth = 0): Promise<Array<Record<string, unknown>>> => {
-    if (depth > 4) return [];
-    const entries = await workspace.fs.readdir(path).catch(() => []);
-    const result: Array<Record<string, unknown>> = [];
-    for (const entry of entries) {
-      const fullPath = path === "/" ? `/${entry.name}` : `${path}/${entry.name}`;
-      result.push({ path: fullPath, name: entry.name, isDirectory: entry.isDirectory });
-      if (entry.isDirectory) result.push(...await walk(fullPath, depth + 1));
-    }
-    return result;
-  };
-  return walk("/");
+  const found: Array<{ path: string; type: "file" | "dir" }> = await workspace.fs.find("/");
+  return found.map((entry) => ({
+    path: entry.path,
+    name: entry.path.split("/").at(-1) ?? entry.path,
+    isDirectory: entry.type === "dir"
+  }));
 }
 
 export async function registerArtifact(
