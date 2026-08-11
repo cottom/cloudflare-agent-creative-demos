@@ -36,9 +36,9 @@ export const api = {
   getProject: (kind: ProjectKind, projectId: string) =>
     request<ProjectState>(`/api/projects/${kind}/${encodeURIComponent(projectId)}`),
 
-  /** Poll variant: returns `{ unchanged: true }` when the revision has not moved. */
+  /** Poll variant: returns `{ unchanged: true }` when nothing in the project moved. */
   getProjectSince: (kind: ProjectKind, projectId: string, since: number) =>
-    request<ProjectState | { unchanged: true; revision: number }>(
+    request<ProjectState | { unchanged: true; stateVersion: number }>(
       `/api/projects/${kind}/${encodeURIComponent(projectId)}?since=${since}`
     ),
 
@@ -67,6 +67,12 @@ export const api = {
     request<{ submissionId: string; accepted: boolean; messages: ClientMessage[]; project: ProjectState }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/messages`, {
       method: "POST",
       body: JSON.stringify({ text, awareness })
+    }),
+
+  setAwareness: (kind: ProjectKind, projectId: string, sessionId: string, awareness?: EditorAwareness) =>
+    request<{ ok: true }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/awareness`, {
+      method: "POST",
+      body: JSON.stringify({ awareness })
     }),
 
   clearMessages: (kind: ProjectKind, projectId: string, sessionId: string) =>

@@ -87,8 +87,12 @@ pnpm setup:r2
 Then deploy:
 
 ```bash
-pnpm deploy
+pnpm run deploy
 ```
+
+`pnpm run` is required here: `deploy` is a built-in pnpm command, so bare
+`pnpm deploy` runs pnpm's own deployment and fails with
+`ERR_PNPM_NOTHING_TO_DEPLOY` instead of running this script.
 
 After dependencies are installed, regenerate authoritative binding types whenever `wrangler.jsonc` changes:
 

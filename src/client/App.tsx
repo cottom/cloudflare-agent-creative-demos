@@ -13,7 +13,7 @@ import type {
 import { AgentPanel } from "./components/AgentPanel";
 import { CanvasStudio } from "./components/CanvasStudio";
 import { PptStudio } from "./components/PptStudio";
-import { api, type ClientMessage } from "./lib/api";
+import { api } from "./lib/api";
 import { usePolling } from "./lib/usePolling";
 
 type ProjectMap = { ppt: PptProjectState; canvas: CanvasProjectState };
@@ -24,7 +24,6 @@ export default function App() {
   const [projects, setProjects] = useState<ProjectMap | null>(null);
   const [activeSessions, setActiveSessions] = useState<Record<ProjectKind, string>>({ ppt: "ppt-session-main", canvas: "canvas-session-main" });
   const [selected, setSelected] = useState<Record<ProjectKind, string | undefined>>({ ppt: undefined, canvas: undefined });
-  const [messages, setMessages] = useState<ClientMessage[]>([]);
   const [models, setModels] = useState({ llm: "Workers AI", image: "Workers AI" });
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -62,25 +61,12 @@ export default function App() {
     })();
   }, []);
 
-  useEffect(() => {
-    if (!activeProject || !activeSessionId) return;
-    void api.getMessages(activeKind, activeProject.id, activeSessionId)
-      .then((result) => setMessages(result.messages))
-      .catch((caught) => setError(caught instanceof Error ? caught.message : String(caught)));
-  }, [activeKind, activeSessionId, activeProject?.id]);
-
   usePolling(async () => {
     if (!activeProject || busy) return;
-    const next = await api.getProjectSince(activeKind, activeProject.id, activeProject.revision);
+    const next = await api.getProjectSince(activeKind, activeProject.id, activeProject.stateVersion);
     if ("unchanged" in next) return;
     setProjects((existing) => existing ? { ...existing, [activeKind]: next } as ProjectMap : existing);
   }, 1600, Boolean(activeProject));
-
-  usePolling(async () => {
-    if (!activeProject || !activeSessionId) return;
-    const result = await api.getMessages(activeKind, activeProject.id, activeSessionId);
-    setMessages(result.messages);
-  }, 1200, Boolean(activeProject && activeSessionId));
 
   const run = async (action: () => Promise<void>) => {
     setBusy(true);
@@ -117,24 +103,6 @@ export default function App() {
       const result = await api.createSession(activeKind, activeProject.id);
       setProjects((current) => current ? { ...current, [activeKind]: result.project } as ProjectMap : current);
       setActiveSessions((current) => ({ ...current, [activeKind]: result.sessionId }));
-      setMessages([]);
-    });
-  };
-
-  const clearSession = async () => {
-    if (!activeProject) return;
-    await run(async () => {
-      await api.clearMessages(activeKind, activeProject.id, activeSessionId);
-      setMessages([]);
-    });
-  };
-
-  const sendMessage = async (text: string) => {
-    if (!activeProject) return;
-    await run(async () => {
-      const result = await api.sendMessage(activeKind, activeProject.id, activeSessionId, text, awareness);
-      setMessages(result.messages);
-      setProjects((current) => current ? { ...current, [activeKind]: result.project } as ProjectMap : current);
     });
   };
 
@@ -236,13 +204,11 @@ export default function App() {
       <AgentPanel
         project={activeProject}
         activeSessionId={activeSessionId}
-        messages={messages}
         busy={busy}
         awareness={awareness}
         onSelectSession={(sessionId) => setActiveSessions((current) => ({ ...current, [activeKind]: sessionId }))}
         onCreateSession={createSession}
-        onClearSession={clearSession}
-        onSend={sendMessage}
+        onProjectChanged={() => refreshProject(activeKind)}
         onApproveInteraction={resolveInteraction}
         onRejectInteraction={rejectInteraction}
       />

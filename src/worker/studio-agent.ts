@@ -2,13 +2,24 @@ import { Session, Think } from "@cloudflare/think";
 import { tool, type ToolSet, type UIMessage } from "ai";
 import { z } from "zod";
 import { PPT_THEMES } from "../shared/themes";
+import { uiSpecSchema } from "../shared/ui-schema";
+import {
+  createShapeElement,
+  createTableElement,
+  createTextElement,
+  elementsFromLayout,
+  nextZ
+} from "../shared/slide-elements";
+import { studioAgentName } from "../shared/policy";
 import type {
   CanvasCommand,
   CanvasNode,
   CanvasVariantsWorkflowParams,
   ChatMessage,
+  ChatMessagePart,
   EditorAwareness,
   JsonObject,
+  JsonValue,
   PptBuildWorkflowParams,
   PptCommand,
   ProjectCommand,
@@ -16,6 +27,8 @@ import type {
   ProjectKind,
   ProjectState,
   SessionMeta,
+  SlideElement,
+  SlideElementPatch,
   StudioAgentConfig,
   WorkflowProgressPayload,
   WorkflowRun
@@ -41,20 +54,41 @@ function toChatMessage(message: UIMessage): ChatMessage {
   return {
     id: message.id,
     role: message.role,
-    parts: message.parts.map((part) => ({
-      type: part.type,
-      ...("text" in part && typeof part.text === "string" ? { text: part.text } : {})
-    }))
+    parts: message.parts.map((part): ChatMessagePart => {
+      const source = part as Record<string, unknown>;
+      const projected: ChatMessagePart = { type: part.type };
+      if (typeof source.text === "string") projected.text = source.text;
+      // Tool parts drive the interactive UI: without the call id, lifecycle
+      // state, and input/output payloads the client receives a bare `{ type }`
+      // and has nothing to render.
+      if (typeof source.toolCallId === "string") projected.toolCallId = source.toolCallId;
+      if (typeof source.state === "string") projected.state = source.state as ChatMessagePart["state"];
+      if (source.input !== undefined) projected.input = toJsonValue(source.input);
+      if (source.output !== undefined) projected.output = toJsonValue(source.output);
+      if (typeof source.errorText === "string") projected.errorText = source.errorText;
+      return projected;
+    })
   };
+}
+
+/**
+ * Normalise an arbitrary tool payload into the JSON subset that survives the
+ * Workers RPC boundary. Round-tripping also drops `undefined` and functions,
+ * which `Rpc.Serializable` would otherwise reject.
+ */
+function toJsonValue(value: unknown): JsonValue {
+  try {
+    return JSON.parse(JSON.stringify(value ?? null)) as JsonValue;
+  } catch {
+    return null;
+  }
 }
 
 const MAX_MUTATION_ATTEMPTS = 4;
 /** Per-attempt delay in ms; index 0 is unused because the first try is immediate. */
 const BACKOFF_MS = [0, 25, 75, 200];
 
-export function studioAgentName(kind: ProjectKind, projectId: string, sessionId: string): string {
-  return `${kind}--${projectId}--${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 180);
-}
+export { studioAgentName } from "../shared/policy";
 
 function workflowType(workflowName: string): WorkflowRun["type"] {
   return workflowName.includes("PPT") ? "ppt_build" : "canvas_variants";
@@ -396,30 +430,30 @@ export class StudioAgent extends Think<Env> {
           return { ok: true, path };
         }
       }),
-      request_user_choice: tool({
-        description: "Create a structured choice card in the project UI when user input is necessary before proceeding.",
-        inputSchema: z.object({
-          title: z.string().min(3),
-          description: z.string().optional(),
-          options: z.array(z.object({ value: z.string(), label: z.string(), description: z.string().optional() })).min(2).max(8),
-          multiple: z.boolean().default(false)
-        }),
-        execute: async ({ title, description, options, multiple }) => {
-          const current = this.requireConfig();
-          const interaction: ProjectInteraction = {
-            id: `agent-interaction-${crypto.randomUUID()}`,
-            projectId: current.projectId,
-            sessionId: current.sessionId,
-            source: "agent",
-            kind: multiple ? "multi_select" : "choice",
-            title,
-            description,
-            payload: { options, multiple },
-            status: "pending",
-            createdAt: new Date().toISOString()
-          };
-          return this.createWorkflowInteraction(interaction);
-        }
+      ask_user: tool({
+        description: [
+          "Render an interactive card in the chat and wait for the user's answer.",
+          "Use it whenever a decision must be made before you act.",
+          "Components: 'choice' (big tappable cards, 2-5 options),",
+          "'radio' (compact single pick), 'select' (dropdown, good for 6+ options),",
+          "'multi_select' (several picks, honours minSelected/maxSelected),",
+          "'form' (typed fields), 'confirm' (yes/no gate).",
+          "Form field types: text, textarea, number, email, url, date, select,",
+          "radio, checkbox, multi_select, slider — with required, min, max, step,",
+          "minLength, maxLength and pattern for validation.",
+          "For dependent questions use showIf ({field, equals|oneOf}) to reveal a",
+          "field only on a branch, and optionsBy ({field, map}) to make one",
+          "select's options depend on another's value.",
+          "Give an option a 'path' when it selects a branch you will follow;",
+          "the chosen path is returned to you verbatim.",
+          "Ask for everything you need in one card rather than several turns.",
+          "Do not describe the card in prose — returning the spec renders it."
+        ].join(" "),
+        inputSchema: uiSpecSchema
+        // No `execute` on purpose. A tool with no server-side implementation is
+        // surfaced to the client as `state: "input-available"`, which renders
+        // the component; the user's answer is returned via `addToolOutput` and
+        // the model continues from there.
       })
     };
 
@@ -462,6 +496,94 @@ export class StudioAgent extends Think<Env> {
           execute: async ({ themeId }) => this.applyCommands([
             { type: "ppt.set_theme", theme: PPT_THEMES[themeId] }
           ], `Changed presentation theme to ${themeId}`, "agent")
+        }),
+        convert_slide_to_elements: tool({
+          description: "Turn a fixed-layout slide into freely positionable elements. Required before any element tool can edit that slide.",
+          inputSchema: z.object({ slideId: z.string() }),
+          execute: async ({ slideId }) => {
+            const state = await this.getProjectSnapshot();
+            if (state.kind !== "ppt") throw new Error("Project kind mismatch");
+            const slide = state.document.slides.find((item) => item.id === slideId);
+            if (!slide) throw new Error(`Slide not found: ${slideId}`);
+            if (slide.elements.length) return { ok: true, alreadyFreeform: true, elements: slide.elements.length };
+            const elements = elementsFromLayout(slide, state.document.theme);
+            await this.applyCommands(
+              elements.map((element) => ({ type: "ppt.add_element", slideId, element }) as PptCommand),
+              `Converted slide to ${elements.length} editable elements`,
+              "agent"
+            );
+            return { ok: true, elements: elements.length };
+          }
+        }),
+        add_slide_element: tool({
+          description: "Add a text box, shape, table or image to a freeform slide. Geometry is in inches on a 13.333 x 7.5 slide.",
+          inputSchema: z.object({
+            slideId: z.string(),
+            type: z.enum(["text", "shape", "table"]),
+            x: z.number().min(0).max(13.333),
+            y: z.number().min(0).max(7.5),
+            w: z.number().min(0.15).max(13.333),
+            h: z.number().min(0.15).max(7.5),
+            text: z.string().max(2000).optional(),
+            fontSize: z.number().min(6).max(200).optional(),
+            bold: z.boolean().optional(),
+            color: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
+            shape: z.enum(["rect", "roundRect", "ellipse", "triangle", "line"]).optional(),
+            fill: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
+            rows: z.array(z.array(z.string().max(120)).max(8)).max(10).optional()
+          }),
+          execute: async ({ slideId, type, x, y, w, h, text, fontSize, bold, color, shape, fill, rows }) => {
+            const state = await this.getProjectSnapshot();
+            if (state.kind !== "ppt") throw new Error("Project kind mismatch");
+            const slide = state.document.slides.find((item) => item.id === slideId);
+            if (!slide) throw new Error(`Slide not found: ${slideId}`);
+            if (!slide.elements.length) throw new Error("Slide is still layout-driven; call convert_slide_to_elements first");
+            const z = nextZ(slide.elements);
+            const element: SlideElement =
+              type === "text" ? createTextElement({ x, y, w, h, z, text: text ?? "New text", fontSize: fontSize ?? 18, bold, color })
+                : type === "shape" ? createShapeElement({ x, y, w, h, z, shape: shape ?? "rect", fill: fill ?? "5B6CFF" })
+                : createTableElement({ x, y, w, h, z, ...(rows?.length ? { rows } : {}) });
+            await this.applyCommands([{ type: "ppt.add_element", slideId, element }], `Added ${type} element`, "agent");
+            return { ok: true, elementId: element.id };
+          }
+        }),
+        update_slide_element: tool({
+          description: "Change an existing element's text, style, position, size, rotation or layer.",
+          inputSchema: z.object({
+            slideId: z.string(),
+            elementId: z.string(),
+            text: z.string().max(2000).optional(),
+            fontSize: z.number().min(6).max(200).optional(),
+            bold: z.boolean().optional(),
+            italic: z.boolean().optional(),
+            underline: z.boolean().optional(),
+            color: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
+            fill: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
+            align: z.enum(["left", "center", "right"]).optional(),
+            x: z.number().optional(),
+            y: z.number().optional(),
+            w: z.number().optional(),
+            h: z.number().optional(),
+            rotation: z.number().optional(),
+            z: z.number().optional()
+          }),
+          execute: async ({ slideId, elementId, ...patch }) => {
+            const clean = Object.fromEntries(
+              Object.entries(patch).filter(([, value]) => value !== undefined)
+            ) as SlideElementPatch;
+            await this.applyCommands(
+              [{ type: "ppt.update_element", slideId, elementId, patch: clean }],
+              `Updated element ${elementId}`,
+              "agent"
+            );
+            return { ok: true };
+          }
+        }),
+        delete_slide_element: tool({
+          description: "Remove an element from a slide.",
+          inputSchema: z.object({ slideId: z.string(), elementId: z.string() }),
+          execute: async ({ slideId, elementId }) =>
+            this.applyCommands([{ type: "ppt.delete_element", slideId, elementId }], `Deleted element ${elementId}`, "agent")
         }),
         build_presentation_workflow: tool({
           description: "Start a durable, human-reviewed workflow to create or substantially rebuild a presentation.",

@@ -1,6 +1,7 @@
 import { AgentWorkflow } from "agents/workflows";
-import type { AgentWorkflowEvent, AgentWorkflowStep, ApprovalEventPayload } from "agents/workflows";
+import type { AgentWorkflowEvent, AgentWorkflowStep } from "agents/workflows";
 import type {
+  ApprovalMetadata,
   ExportArtifact,
   PptBuildWorkflowParams,
   ProjectInteraction,
@@ -47,11 +48,13 @@ export class PptBuildWorkflow extends AgentWorkflow<StudioAgent, PptBuildWorkflo
       message: "Waiting for presentation plan approval", interactionId
     });
 
-    const approval = await this.waitForApproval<ApprovalEventPayload>(step, {
+    // `waitForApproval` resolves only when approved — it inspects `approved`
+    // itself and throws `WorkflowRejectedError` otherwise — and it returns the
+    // approval's `metadata`, not the event envelope.
+    const approval = await this.waitForApproval<ApprovalMetadata | undefined>(step, {
       timeout: "7 days"
     });
-    if (!approval.approved) throw new Error(approval.reason ?? "Presentation plan was not approved");
-    const response = (approval.metadata?.response as Record<string, unknown> | undefined) ?? {};
+    const response = approval?.response ?? {};
 
     await this.reportProgress({ step: "write", status: "running", percent: 0.35, message: "Writing the approved deck" });
     const document = await step.do("generate-final-presentation", {
@@ -59,14 +62,20 @@ export class PptBuildWorkflow extends AgentWorkflow<StudioAgent, PptBuildWorkflo
       timeout: "8 minutes"
     }, async () => generatePresentationDocument(this.env, params, plan, response));
 
-    const state = await step.do(
+    // Return only the revision: `applyWorkflowCommands` resolves to the whole
+    // project, which would be persisted as this step's output and counts
+    // against the 1 MiB step-result limit.
+    const revision = await step.do(
       "commit-presentation-project",
-      async (): Promise<ProjectState> => this.agent.applyWorkflowCommands(
-        this.workflowId,
-        [{ type: "ppt.replace_document", document }],
-        `Workflow rebuilt presentation: ${document.title}`,
-        "commit-presentation-document"
-      )
+      async (): Promise<number> => {
+        const state = await this.agent.applyWorkflowCommands(
+          this.workflowId,
+          [{ type: "ppt.replace_document", document }],
+          `Workflow rebuilt presentation: ${document.title}`,
+          "commit-presentation-document"
+        );
+        return state.revision;
+      }
     );
 
     await this.reportProgress({ step: "export", status: "running", percent: 0.82, message: "Rendering a real PPTX export" });
@@ -75,7 +84,7 @@ export class PptBuildWorkflow extends AgentWorkflow<StudioAgent, PptBuildWorkflo
       timeout: "5 minutes"
     }, async (): Promise<ExportArtifact> => this.agent.exportCurrentPpt());
 
-    const result = { projectId: params.projectId, revision: state.revision, slideCount: document.slides.length, artifact };
+    const result = { projectId: params.projectId, revision, slideCount: document.slides.length, artifact };
     await this.reportProgress({ step: "complete", status: "complete", percent: 1, message: "Presentation and PPTX are ready" });
     await step.reportComplete(result);
     return result;

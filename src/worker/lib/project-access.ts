@@ -18,7 +18,7 @@ type ProjectStub = ReturnType<typeof getProjectStub>;
  * even though it forwards every call correctly. Narrowed once, here.
  */
 function openWorkspace(stub: ProjectStub) {
-  return getWorkspace(stub as unknown as Parameters<typeof getWorkspace>[0]);
+  return getWorkspace(stub as Parameters<typeof getWorkspace>[0]);
 }
 
 function validateWorkspacePath(path: string): void {
@@ -79,7 +79,12 @@ async function pruneRevisionHistory(
     if (!stale.length) return;
     await Promise.all(stale.map((name) => workspace.fs.rm(`${REVISIONS_DIR}/${name}`)));
   } catch (error) {
-    console.error("workspace revision prune failed:", error);
+    console.error(JSON.stringify({
+      event: "revision_prune_failed",
+      revisionsDir: REVISIONS_DIR,
+      currentRevision,
+      error: error instanceof Error ? error.message : String(error)
+    }));
   }
 }
 

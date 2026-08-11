@@ -33,3 +33,14 @@ export function staleRevisionFiles(names: string[], limit = REVISION_HISTORY_LIM
 export function isServableArtifactKey(key: string): boolean {
   return /^(ppt|canvas)\/[\w./-]+$/.test(key) && !key.includes("..");
 }
+
+/**
+ * Durable Object instance name for a project's Agent session.
+ *
+ * Shared rather than worker-local because the browser needs the identical
+ * string to open its WebSocket at `/agents/studio-agent/<name>`; if the two
+ * sides disagree the client silently talks to a different, unconfigured agent.
+ */
+export function studioAgentName(kind: string, projectId: string, sessionId: string): string {
+  return `${kind}--${projectId}--${sessionId}`.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 180);
+}

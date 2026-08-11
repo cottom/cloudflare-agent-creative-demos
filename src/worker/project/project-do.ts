@@ -18,6 +18,11 @@ import type {
 const STATE_KEY = "project:state";
 const commandKey = (commandId: string) => `project:command:${commandId}`;
 
+/** States persisted before `stateVersion` existed read back as `undefined`. */
+function stateVersionOf(state: { stateVersion?: number }): number {
+  return typeof state.stateVersion === "number" ? state.stateVersion : 0;
+}
+
 type CommandLedgerEntry = {
   fingerprint: string;
   committedRevision: number;
@@ -65,9 +70,26 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
   /**
    * Cheap change check for pollers: avoids cloning and RPC-serializing the
    * whole project just to discover nothing moved.
+   *
+   * Returns `stateVersion`, not `revision`. Interactions, workflow progress,
+   * sessions and artifacts all change state without advancing the document
+   * revision, and a poller guarding on `revision` would never see them.
    */
-  async getRevision(): Promise<number> {
-    return (await this.ensureState()).revision;
+  async getStateVersion(): Promise<number> {
+    return stateVersionOf(await this.ensureState());
+  }
+
+  /**
+   * Single write path for project state. Every mutation — document edit or
+   * not — advances `stateVersion` so pollers and clients observe it.
+   */
+  private async putState<T extends TState>(
+    transaction: { put(key: string, value: unknown): Promise<void> },
+    next: T
+  ): Promise<T> {
+    const versioned = { ...next, stateVersion: stateVersionOf(next) + 1 } as T;
+    await transaction.put(STATE_KEY, versioned);
+    return versioned;
   }
 
   async applyMutation(mutation: ProjectMutation): Promise<MutationResult<TState>> {
@@ -85,7 +107,7 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
 
       const result = applyMutation(state, mutation);
       if (result.ok) {
-        await transaction.put(STATE_KEY, result.state);
+        result.state = await this.putState(transaction, result.state);
         await transaction.put(key, {
           fingerprint,
           committedRevision: result.revision
@@ -109,8 +131,7 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
           )
         : [session, ...state.sessions];
       const next = { ...state, sessions, updatedAt: new Date().toISOString() } as TState;
-      await transaction.put(STATE_KEY, next);
-      return structuredClone(next);
+      return structuredClone(await this.putState(transaction, next));
     });
   }
 
@@ -122,8 +143,7 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
         session.id === sessionId ? { ...session, title, updatedAt: now } : session
       );
       const next = { ...state, sessions, updatedAt: now } as TState;
-      await transaction.put(STATE_KEY, next);
-      return structuredClone(next);
+      return structuredClone(await this.putState(transaction, next));
     });
   }
 
@@ -137,7 +157,7 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
         interactions: [interaction, ...state.interactions],
         updatedAt: new Date().toISOString()
       } as TState;
-      await transaction.put(STATE_KEY, next);
+      await this.putState(transaction, next);
       return structuredClone(interaction);
     });
   }
@@ -162,7 +182,7 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
       const interactions = [...state.interactions];
       interactions[index] = resolved;
       const next = { ...state, interactions, updatedAt: resolved.resolvedAt } as TState;
-      await transaction.put(STATE_KEY, next);
+      await this.putState(transaction, next);
       return structuredClone(resolved);
     });
   }
@@ -183,7 +203,7 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
         workflows: workflows.slice(0, 50),
         updatedAt: new Date().toISOString()
       } as TState;
-      await transaction.put(STATE_KEY, next);
+      await this.putState(transaction, next);
       return structuredClone(workflow);
     });
   }
@@ -193,8 +213,7 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
       const state = (await transaction.get<TState>(STATE_KEY)) ?? this.createInitialState();
       const artifacts = [artifact, ...state.artifacts.filter((item) => item.id !== artifact.id)].slice(0, 100);
       const next = { ...state, artifacts, updatedAt: new Date().toISOString() } as TState;
-      await transaction.put(STATE_KEY, next);
-      return structuredClone(next);
+      return structuredClone(await this.putState(transaction, next));
     });
   }
 
@@ -213,12 +232,27 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
           objective: state.document.objective,
           audience: state.document.audience,
           theme: state.document.theme,
+          slideSize: { widthIn: 13.333, heightIn: 7.5 },
           slides: state.document.slides.map((slide, index) => ({
             index: index + 1,
             id: slide.id,
             title: slide.title,
             layout: slide.layout,
-            bodyPreview: slide.body.slice(0, 4)
+            bodyPreview: slide.body.slice(0, 4),
+            // Freeform slides are edited element-by-element, so the agent needs
+            // ids and geometry to target them; layout slides have none yet.
+            freeform: slide.elements.length > 0,
+            elements: slide.elements.map((element) => ({
+              id: element.id,
+              type: element.type,
+              x: element.x,
+              y: element.y,
+              w: element.w,
+              h: element.h,
+              z: element.z,
+              ...(element.type === "text" ? { text: element.text.slice(0, 160), fontSize: element.fontSize } : {}),
+              ...(element.type === "shape" ? { shape: element.shape, fill: element.fill } : {})
+            }))
           }))
         },
         selection: selected
@@ -275,7 +309,7 @@ class CanvasProjectCore extends ProjectCore<CanvasProjectState> {
  * direction, so the storage handle is narrowed at this single seam.
  */
 const workspaceStorageOf = (self: { workspaceStorage: DurableObjectStorage }) =>
-  ({ storage: self.workspaceStorage as unknown as WorkspaceOptions["storage"] });
+  ({ storage: self.workspaceStorage as WorkspaceOptions["storage"] });
 
 export class PptProject extends withWorkspace(PptProjectCore, workspaceStorageOf) {}
 export class CanvasProject extends withWorkspace(CanvasProjectCore, workspaceStorageOf) {}

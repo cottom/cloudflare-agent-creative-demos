@@ -82,3 +82,89 @@ describe("project mutation contract", () => {
     }))).toThrow("at least one slide");
   });
 });
+
+describe("slide element editing", () => {
+  const seed = () => {
+    const state = createInitialPptState("ppt-elements");
+    const slide = state.document.slides[0]!;
+    slide.elements = [
+      { id: "el-a", type: "shape", shape: "rect", x: 1, y: 1, w: 2, h: 1, rotation: 0, z: 1, fill: "5B6CFF" },
+      { id: "el-b", type: "text", text: "Hello", role: "body", fontSize: 18, x: 2, y: 2, w: 4, h: 1, rotation: 0, z: 2 }
+    ];
+    return { state, slideId: slide.id };
+  };
+
+  it("adds an element and rejects a duplicate id", () => {
+    const { state, slideId } = seed();
+    const added = applyMutation(state, mutation({
+      commands: [{
+        type: "ppt.add_element",
+        slideId,
+        element: { id: "el-c", type: "text", text: "New", role: "body", fontSize: 12, x: 0, y: 0, w: 1, h: 1, rotation: 0, z: 3 }
+      }]
+    }));
+    expect(added.ok).toBe(true);
+    if (!added.ok) return;
+    expect(added.state.document.slides[0]?.elements).toHaveLength(3);
+
+    expect(() => applyMutation(added.state, mutation({
+      commandId: "command-dup",
+      baseRevision: 2,
+      commands: [{
+        type: "ppt.add_element",
+        slideId,
+        element: { id: "el-c", type: "text", text: "Dup", role: "body", fontSize: 12, x: 0, y: 0, w: 1, h: 1, rotation: 0, z: 4 }
+      }]
+    }))).toThrow("Slide element exists");
+  });
+
+  it("patches an element without changing its id or type", () => {
+    const { state, slideId } = seed();
+    const result = applyMutation(state, mutation({
+      commands: [{ type: "ppt.update_element", slideId, elementId: "el-b", patch: { text: "Edited", bold: true, type: "shape" } as never }]
+    }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const element = result.state.document.slides[0]?.elements.find((item) => item.id === "el-b");
+    expect(element?.type).toBe("text");
+    if (element?.type !== "text") return;
+    expect(element.text).toBe("Edited");
+    expect(element.bold).toBe(true);
+  });
+
+  it("clamps geometry so an element cannot be dragged off the slide", () => {
+    const { state, slideId } = seed();
+    const result = applyMutation(state, mutation({
+      commands: [{ type: "ppt.update_element", slideId, elementId: "el-a", patch: { x: 999, y: -999, w: 0.01 } }]
+    }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const element = result.state.document.slides[0]?.elements.find((item) => item.id === "el-a")!;
+    expect(element.w).toBeGreaterThanOrEqual(0.15);
+    expect(element.x).toBeLessThanOrEqual(13.333);
+    expect(element.y).toBeGreaterThanOrEqual(-element.h / 2);
+  });
+
+  it("reorders and deletes elements", () => {
+    const { state, slideId } = seed();
+    const ordered = applyMutation(state, mutation({
+      commands: [{ type: "ppt.set_element_order", slideId, elementId: "el-a", z: 9 }]
+    }));
+    expect(ordered.ok).toBe(true);
+    if (!ordered.ok) return;
+    expect(ordered.state.document.slides[0]?.elements.find((item) => item.id === "el-a")?.z).toBe(9);
+
+    const deleted = applyMutation(ordered.state, mutation({
+      commandId: "command-del", baseRevision: 2,
+      commands: [{ type: "ppt.delete_element", slideId, elementId: "el-a" }]
+    }));
+    expect(deleted.ok).toBe(true);
+    if (!deleted.ok) return;
+    expect(deleted.state.document.slides[0]?.elements).toHaveLength(1);
+
+    expect(() => applyMutation(deleted.state, mutation({
+      commandId: "command-del2", baseRevision: 3,
+      commands: [{ type: "ppt.delete_element", slideId, elementId: "missing" }]
+    }))).toThrow("Slide element not found");
+  });
+});

@@ -102,7 +102,7 @@ async function bootstrapDemo(env: Env) {
   };
 }
 
-async function handleApi(request: Request, env: Env): Promise<Response | null> {
+async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response | null> {
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/api/")) return null;
   const parts = url.pathname.split("/").filter(Boolean);
@@ -145,11 +145,14 @@ async function handleApi(request: Request, env: Env): Promise<Response | null> {
     await projectStub.initialize(projectId);
 
     if (parts.length === 4 && method === "GET") {
-      // Pollers pass ?since=<revision>; skip the full payload when unchanged.
+      // Pollers pass ?since=<stateVersion>; skip the full payload when
+      // unchanged. This must be stateVersion rather than revision: creating an
+      // interaction or advancing a workflow leaves revision alone, and
+      // guarding on revision would hide those from the client entirely.
       const since = Number(url.searchParams.get("since"));
       if (Number.isInteger(since)) {
-        const revision = await projectStub.getRevision();
-        if (revision === since) return json({ unchanged: true, revision });
+        const stateVersion = await projectStub.getStateVersion();
+        if (stateVersion === since) return json({ unchanged: true, stateVersion });
       }
       return json(await projectStub.getSnapshot());
     }
@@ -157,7 +160,20 @@ async function handleApi(request: Request, env: Env): Promise<Response | null> {
       const mutation = await readJson<ProjectMutation>(request);
       const result = await projectStub.applyMutation(mutation);
       if (!result.ok) return json(result, 409);
-      await syncProjectWorkspace(env, result.state);
+      // The Durable Object is the source of truth and has already committed;
+      // the workspace mirror is derived, so it runs after the response rather
+      // than adding its round trips to every edit's latency.
+      ctx.waitUntil(
+        syncProjectWorkspace(env, result.state).catch((error: unknown) => {
+          console.error(JSON.stringify({
+            event: "workspace_sync_failed",
+            projectId,
+            kind,
+            revision: result.revision,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+        })
+      );
       return json(result);
     }
     if (parts.length === 5 && parts[4] === "workspace" && method === "GET") {
@@ -197,6 +213,13 @@ async function handleApi(request: Request, env: Env): Promise<Response | null> {
         const turn = await agent.sendUserMessage(body.text, body.awareness);
         return json({ ...turn, project: await projectStub.getSnapshot() });
       }
+      // Editor selection is agent configuration, not chat content. The
+      // streaming client pushes it just before a turn so "this slide" resolves.
+      if (parts[6] === "awareness" && parts.length === 7 && method === "POST") {
+        const body = await readJson<{ awareness?: EditorAwareness }>(request);
+        await agent.setEditorAwareness(body.awareness);
+        return json({ ok: true });
+      }
       if (parts[6] === "clear" && parts.length === 7 && method === "POST") {
         await agent.clearConversation();
         return json({ ok: true, messages: [] });
@@ -226,9 +249,11 @@ async function handleApi(request: Request, env: Env): Promise<Response | null> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  // `ctx` is passed whole, never destructured: pulling `waitUntil` off it
+  // loses its binding and throws "Illegal invocation" at runtime.
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
-      const api = await handleApi(request, env);
+      const api = await handleApi(request, env, ctx);
       if (api) return api;
 
       const agentResponse = await routeAgentRequest(request, env, { prefix: "agents" });
@@ -236,10 +261,19 @@ export default {
 
       return env.ASSETS.fetch(request);
     } catch (error) {
-      console.error(error);
+      const status = error instanceof HttpError ? error.status : 500;
+      // Structured logs are queryable in Workers Logs; a bare string is not.
+      console.error(JSON.stringify({
+        event: "request_failed",
+        method: request.method,
+        path: new URL(request.url).pathname,
+        status,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      }));
       // Only deliberate HTTP errors carry a caller-facing message; anything
       // else is an internal fault and its text is not echoed back.
-      if (error instanceof HttpError) return json({ error: error.message }, error.status);
+      if (error instanceof HttpError) return json({ error: error.message }, status);
       return json({ error: "Internal error" }, 500);
     }
   }

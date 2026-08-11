@@ -6,8 +6,34 @@ export function artifactUrl(key: string): string {
   return `/api/artifacts?key=${encodeURIComponent(key)}`;
 }
 
+/**
+ * Load every image referenced by freeform slide elements into data URIs.
+ *
+ * PptxGenJS needs the bytes inline: a Worker cannot fetch its own asset route
+ * mid-request, and R2 objects are not publicly addressable.
+ */
+async function collectSlideImages(env: Env, state: PptProjectState): Promise<Map<string, string>> {
+  const keys = new Set<string>();
+  for (const slide of state.document.slides) {
+    for (const element of slide.elements) {
+      if (element.type === "image" && element.assetKey) keys.add(element.assetKey);
+    }
+  }
+  const entries = await Promise.all([...keys].map(async (key) => {
+    const object = await env.ARTIFACTS.get(key);
+    if (!object) return null;
+    const buffer = await object.arrayBuffer();
+    const contentType = object.httpMetadata?.contentType ?? "image/png";
+    let binary = "";
+    const view = new Uint8Array(buffer);
+    for (let index = 0; index < view.length; index += 1) binary += String.fromCharCode(view[index]!);
+    return [key, `data:${contentType};base64,${btoa(binary)}`] as [string, string];
+  }));
+  return new Map(entries.filter((entry): entry is [string, string] => entry !== null));
+}
+
 export async function savePresentationExport(env: Env, state: PptProjectState): Promise<ExportArtifact> {
-  const bytes = await renderPptx(state.document);
+  const bytes = await renderPptx(state.document, await collectSlideImages(env, state));
   const key = `ppt/${state.id}/revision-${state.revision}.pptx`;
   await env.ARTIFACTS.put(key, bytes, {
     httpMetadata: { contentType: "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
