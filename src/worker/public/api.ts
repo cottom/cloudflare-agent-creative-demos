@@ -3,7 +3,12 @@ import { listAssetKinds, projectObjectName, requireAssetKind } from "../../share
 import { canAccessProject, hasScope, signEmbedToken, type Principal, type Scope } from "../platform/auth";
 import { resolvePrincipal } from "../platform/principal";
 import { getWorkflow, listWorkflows, validateWorkflowParams } from "../platform/workflows";
-import { isWebhookEvent, WEBHOOK_EVENTS } from "../platform/webhooks";
+import {
+  isWebhookEvent,
+  rejectWebhookTarget,
+  TARGET_REJECTION_MESSAGE,
+  WEBHOOK_EVENTS
+} from "../platform/webhooks";
 import { StudioAgent, studioAgentName } from "../studio-agent";
 import { ApiProblem, newRequestId, problem } from "./errors";
 import {
@@ -372,7 +377,8 @@ async function handleAssets(context: Ctx, parts: string[], method: string): Prom
         expires_in: ttl
       },
       requestId,
-      201
+      201,
+      { [NO_REPLAY_HEADER]: "1" }
     );
   }
 
@@ -620,23 +626,17 @@ async function handleWebhooks(context: Ctx, parts: string[], method: string): Pr
   if (parts.length === 1 && method === "POST") {
     const body = await readJson<{ url?: string; events?: string[] }>(context.request);
     const errors: Array<{ field: string; message: string }> = [];
-    let parsed: URL | null = null;
-    try {
-      parsed = body.url ? new URL(body.url) : null;
-    } catch {
-      parsed = null;
-    }
-    if (!parsed) errors.push({ field: "url", message: "url must be an absolute URL" });
-    // Plaintext delivery would put a signed payload — and the receiver's own
-    // data — on the wire in the clear.
-    else if (parsed.protocol !== "https:") errors.push({ field: "url", message: "url must use https" });
+    // One validator, shared with the delivery path, so registration cannot
+    // accept a target that sending would then refuse.
+    const rejection = rejectWebhookTarget(body.url ?? "", env.PUBLIC_ORIGIN);
+    if (rejection) errors.push({ field: "url", message: TARGET_REJECTION_MESSAGE[rejection] });
     const events = (body.events ?? []).filter(isWebhookEvent);
     if (!events.length) {
       errors.push({ field: "events", message: `events must include at least one of: ${WEBHOOK_EVENTS.join(", ")}` });
     }
     if (errors.length) throw problem.validation(errors);
 
-    const record = await tenant.registerWebhook(parsed!.toString(), events);
+    const record = await tenant.registerWebhook(new URL(body.url!).toString(), events);
     return ok(
       {
         id: record.id,
@@ -648,7 +648,8 @@ async function handleWebhooks(context: Ctx, parts: string[], method: string): Pr
         created_at: record.createdAt
       },
       requestId,
-      201
+      201,
+      { [NO_REPLAY_HEADER]: "1" }
     );
   }
 
@@ -704,6 +705,8 @@ async function handleWebhooks(context: Ctx, parts: string[], method: string): Pr
  * with the same key, and caching a 500 would make a transient fault permanent
  * for that key.
  */
+const NO_REPLAY_HEADER = "x-creative-no-replay";
+
 async function withIdempotency(context: Ctx, run: () => Promise<Response>): Promise<Response> {
   const key = context.request.headers.get("idempotency-key");
   if (!key || context.request.method.toUpperCase() !== "POST") return run();
@@ -720,11 +723,23 @@ async function withIdempotency(context: Ctx, run: () => Promise<Response>): Prom
     return ok(JSON.parse(replay.body), context.requestId, replay.status, { "idempotent-replay": "true" });
   }
   const response = await run();
-  if (response.status < 300) {
+  /**
+   * Responses carrying a freshly minted credential are never stored.
+   *
+   * Recording one would write an embed token or a webhook signing secret into
+   * the workspace's database in plaintext, and replay it to anyone presenting
+   * the same key long after it was issued — a credential shown once would
+   * quietly become a credential retrievable for as long as the record lives.
+   * Those calls are cheap and safe to repeat, so the caller simply gets a new
+   * one.
+   */
+  if (response.status < 300 && !response.headers.has(NO_REPLAY_HEADER)) {
     const body = await response.clone().text();
     context.ctx.waitUntil(tenant.recordIdempotent(key, fingerprint, response.status, body).catch(() => {}));
   }
-  return response;
+  const cleaned = new Response(response.body, response);
+  cleaned.headers.delete(NO_REPLAY_HEADER);
+  return cleaned;
 }
 
 export async function handlePublicApi(

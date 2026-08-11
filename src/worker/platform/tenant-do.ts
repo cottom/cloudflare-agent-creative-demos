@@ -5,7 +5,9 @@ import {
   isWebhookEvent,
   MAX_ATTEMPTS,
   nextAttemptDelaySeconds,
-  signPayload
+  rejectWebhookTarget,
+  signPayload,
+  type DeliveryFailure
 } from "./webhooks";
 
 /**
@@ -567,7 +569,22 @@ export class Tenant extends DurableObject<Env> {
       }
 
       const attempts = delivery.attempts + 1;
-      let error: string | null = null;
+      let failure: DeliveryFailure | null = null;
+      let detail = "";
+
+      // Re-checked here, not just at registration: what a hostname means can
+      // change between the two, and this is the moment the request is made.
+      const unsafe = rejectWebhookTarget(webhook.url, this.env.PUBLIC_ORIGIN);
+      if (unsafe) {
+        this.ctx.storage.sql.exec(
+          `UPDATE deliveries SET status = 'failed', attempts = ?, last_error = ? WHERE id = ?`,
+          attempts,
+          "rejected_target" satisfies DeliveryFailure,
+          delivery.id
+        );
+        continue;
+      }
+
       try {
         const timestamp = Math.floor(Date.now() / 1000);
         const response = await fetch(webhook.url, {
@@ -579,38 +596,59 @@ export class Tenant extends DurableObject<Env> {
             "x-delivery-id": delivery.id,
             "x-attempt": String(attempts)
           },
-          body: delivery.body
+          body: delivery.body,
+          // Never follow a redirect. Validating the registered URL is
+          // decorative if a receiver can 302 us to somewhere we refused to be
+          // pointed at directly, and a webhook endpoint has no legitimate
+          // reason to move.
+          redirect: "manual",
+          // A receiver that accepts the connection and then hangs would
+          // otherwise hold the alarm open behind every other delivery.
+          signal: AbortSignal.timeout(10_000)
         });
-        // Any 2xx is success. A 4xx other than 429 is the receiver saying the
-        // request is wrong, which retrying cannot fix, so it is terminal.
+
         if (response.ok) {
           this.ctx.storage.sql.exec(
-            `UPDATE deliveries SET status = 'delivered', attempts = ? WHERE id = ?`,
+            `UPDATE deliveries SET status = 'delivered', attempts = ?, last_error = NULL WHERE id = ?`,
             attempts,
             delivery.id
           );
           continue;
         }
-        error = `HTTP ${response.status}`;
-        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+
+        detail = `HTTP ${response.status}`;
+        if (response.status >= 300 && response.status < 400) failure = "redirected";
+        else if (response.status >= 500) failure = "http_server_error";
+        else failure = "http_client_error";
+
+        // A redirect, or a 4xx that is not 429, is the receiver telling us this
+        // request is wrong. Retrying an unchanged request cannot fix that.
+        if (failure !== "http_server_error" && response.status !== 429) {
           this.ctx.storage.sql.exec(
             `UPDATE deliveries SET status = 'failed', attempts = ?, last_error = ? WHERE id = ?`,
             attempts,
-            error,
+            failure,
             delivery.id
           );
+          console.warn(JSON.stringify({ event: "webhook_failed", id: delivery.id, failure, detail }));
           continue;
         }
       } catch (cause) {
-        error = cause instanceof Error ? cause.message : String(cause);
+        detail = cause instanceof Error ? cause.message : String(cause);
+        failure = /timeout|abort/i.test(detail) ? "timeout" : "connection_failed";
       }
+
+      // The specific reason stays in our logs. Publishing it would let a caller
+      // distinguish "refused", "no such host" and "timed out" for any address
+      // they name, which is a network scanner.
+      console.warn(JSON.stringify({ event: "webhook_retry", id: delivery.id, failure, detail, attempts }));
 
       const delay = attempts >= MAX_ATTEMPTS ? null : nextAttemptDelaySeconds(attempts);
       if (delay === null) {
         this.ctx.storage.sql.exec(
           `UPDATE deliveries SET status = 'failed', attempts = ?, last_error = ? WHERE id = ?`,
           attempts,
-          error,
+          failure,
           delivery.id
         );
       } else {
@@ -618,7 +656,7 @@ export class Tenant extends DurableObject<Env> {
           `UPDATE deliveries SET attempts = ?, due_at = ?, last_error = ? WHERE id = ?`,
           attempts,
           Date.now() + delay * 1000,
-          error,
+          failure,
           delivery.id
         );
       }

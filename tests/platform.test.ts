@@ -25,7 +25,9 @@ import {
   isWebhookEvent,
   MAX_ATTEMPTS,
   nextAttemptDelaySeconds,
-  signPayload
+  rejectWebhookTarget,
+  signPayload,
+  TARGET_REJECTION_MESSAGE
 } from "../src/worker/platform/webhooks";
 
 const SECRET = "test-embed-secret";
@@ -288,5 +290,53 @@ describe("webhook retry schedule", () => {
   it("only accepts events it actually emits", () => {
     expect(isWebhookEvent("run.succeeded")).toBe(true);
     expect(isWebhookEvent("asset.deleted")).toBe(false);
+  });
+});
+
+describe("webhook target safety", () => {
+  const OWN = "https://api.example.com";
+
+  it("accepts an ordinary https endpoint", () => {
+    expect(rejectWebhookTarget("https://hooks.acme.com/creative", OWN)).toBeNull();
+  });
+
+  it("refuses plaintext", () => {
+    expect(rejectWebhookTarget("http://hooks.acme.com/x", OWN)).toBe("not_https");
+  });
+
+  it("refuses IP literals, which name no real receiver", () => {
+    expect(rejectWebhookTarget("https://127.0.0.1/x", OWN)).toBe("ip_literal");
+    expect(rejectWebhookTarget("https://169.254.169.254/latest/meta-data", OWN)).toBe("ip_literal");
+    expect(rejectWebhookTarget("https://10.0.0.5/x", OWN)).toBe("ip_literal");
+    expect(rejectWebhookTarget("https://[::1]/x", OWN)).toBe("ip_literal");
+  });
+
+  it("refuses reserved and metadata hostnames", () => {
+    expect(rejectWebhookTarget("https://localhost/x", OWN)).toBe("reserved_host");
+    expect(rejectWebhookTarget("https://db.internal/x", OWN)).toBe("reserved_host");
+    expect(rejectWebhookTarget("https://printer.local/x", OWN)).toBe("reserved_host");
+    expect(rejectWebhookTarget("https://metadata.google.internal/x", OWN)).toBe("reserved_host");
+  });
+
+  it("refuses our own origin, which would be a loop and an amplifier", () => {
+    expect(rejectWebhookTarget("https://api.example.com/api/bootstrap", OWN)).toBe("own_origin");
+    // A different host on the same scheme is a legitimate receiver.
+    expect(rejectWebhookTarget("https://other.example.com/x", OWN)).toBeNull();
+  });
+
+  it("refuses anything that is not an absolute URL", () => {
+    expect(rejectWebhookTarget("not-a-url", OWN)).toBe("not_absolute");
+    expect(rejectWebhookTarget("", OWN)).toBe("not_absolute");
+  });
+
+  it("still validates when our own origin is unset or malformed", () => {
+    expect(rejectWebhookTarget("https://hooks.acme.com/x")).toBeNull();
+    expect(rejectWebhookTarget("https://127.0.0.1/x", "))not a url((")).toBe("ip_literal");
+  });
+
+  it("has a caller-facing message for every rejection", () => {
+    for (const reason of Object.keys(TARGET_REJECTION_MESSAGE)) {
+      expect(TARGET_REJECTION_MESSAGE[reason as keyof typeof TARGET_REJECTION_MESSAGE]).toBeTruthy();
+    }
   });
 });
