@@ -87,11 +87,23 @@ if (!token) {
   editor.on("*", (event) => write(`event:${event.type}`, event));
   editor.ready.then((ready) => write("ready", ready));
 
+  window.addEventListener("unhandledrejection", (event) => {
+    const error = event.reason;
+    write("error", { code: error?.code, message: error?.message, requestId: error?.requestId });
+    event.preventDefault();
+  });
+
   document.getElementById("save").onclick = () => editor.save();
   document.getElementById("get").onclick = () => editor.getContent();
   document.getElementById("ask").onclick = () =>
     editor.sendMessage("Tighten the wording on the opening slide.");
 
+  /**
+   * Running a flow needs the `workflows:run` scope, which an embed session does
+   * not get by default — flows spend money and rewrite the asset, so they are
+   * opt-in. Mint the session with `scopes: [..., "workflows:run"]` to enable
+   * this button; the API caps whatever you ask for by the key's own scopes.
+   */
   document.getElementById("run").onclick = async () => {
     const { assetId } = await editor.ready;
     const run = await api.runs.start(assetId, "presentation.generate", {

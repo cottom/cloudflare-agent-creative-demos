@@ -1,0 +1,10 @@
+- generic [active] [ref=f5e1]:
+  - banner [ref=f5e2]:
+    - heading "Host application (integration example)" [level=1] [ref=f5e3]
+    - button "Save" [ref=f5e4] [cursor=pointer]
+    - button "Get content" [ref=f5e5] [cursor=pointer]
+    - button "Ask the agent" [ref=f5e6] [cursor=pointer]
+    - button "Generate deck" [ref=f5e7] [cursor=pointer]
+  - main [ref=f5e8]:
+    - iframe [ref=f5e10]:
+      
