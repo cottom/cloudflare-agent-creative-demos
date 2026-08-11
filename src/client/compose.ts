@@ -68,6 +68,9 @@ async function composeDeck(host: HTMLElement, request: ComposeRequest): Promise<
         : {})
     });
 
+    // Without this the deck keeps PPTist's placeholder name.
+    await controller.deck.setTitle(request.title);
+
     const plan = (setup.data as { plan?: { slides?: Array<{ anchor?: string }> } } | undefined)?.plan;
 
     for (const [index, slide] of rest.entries()) {
@@ -84,6 +87,11 @@ async function composeDeck(host: HTMLElement, request: ComposeRequest): Promise<
         ...(result.warnings ?? []),
         ...(result.errors ?? [])
       ].map((issue) => (typeof issue === "string" ? issue : issue?.message ?? JSON.stringify(issue)));
+      // A failed slide silently disappears from the deck otherwise, which
+      // reads as "the model wrote a short deck" rather than "this broke".
+      if (!result.ok) {
+        issues.unshift(`createFromLayout failed for "${slide.layoutId}" — slide omitted`);
+      }
       if (issues.length) {
         warnings.push({ slide: index + 2, layoutId: slide.layoutId, messages: issues });
       }

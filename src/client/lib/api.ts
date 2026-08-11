@@ -10,7 +10,11 @@ import type {
   ProjectState
 } from "../../shared/types";
 
-/** The wire shape is defined once, in shared/types, and served by the agent. */
+/**
+ * The chat itself runs over the Agent WebSocket, so the REST message endpoints
+ * are no longer called from the client. They remain on the server as a
+ * scriptable fallback; this type is kept for that contract.
+ */
 export type ClientMessage = ChatMessage;
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -60,25 +64,10 @@ export const api = {
       body: JSON.stringify({ title })
     }),
 
-  getMessages: (kind: ProjectKind, projectId: string, sessionId: string) =>
-    request<{ messages: ClientMessage[] }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/messages`),
-
-  sendMessage: (kind: ProjectKind, projectId: string, sessionId: string, text: string, awareness?: EditorAwareness) =>
-    request<{ submissionId: string; accepted: boolean; messages: ClientMessage[]; project: ProjectState }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/messages`, {
-      method: "POST",
-      body: JSON.stringify({ text, awareness })
-    }),
-
   setAwareness: (kind: ProjectKind, projectId: string, sessionId: string, awareness?: EditorAwareness) =>
     request<{ ok: true }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/awareness`, {
       method: "POST",
       body: JSON.stringify({ awareness })
-    }),
-
-  clearMessages: (kind: ProjectKind, projectId: string, sessionId: string) =>
-    request<{ ok: true; messages: ClientMessage[] }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/clear`, {
-      method: "POST",
-      body: JSON.stringify({})
     }),
 
   startPptBuild: (projectId: string, sessionId: string, params: Omit<PptBuildWorkflowParams, "projectId" | "sessionId">) =>
@@ -120,10 +109,6 @@ export const api = {
   workspace: (kind: ProjectKind, projectId: string) =>
     request<{ files: Array<{ path: string; name: string; isDirectory: boolean }> }>(`/api/projects/${kind}/${encodeURIComponent(projectId)}/workspace`)
 };
-
-export function messageText(message: ClientMessage): string {
-  return message.parts.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
-}
 
 export function assetUrl(key: string): string {
   return `/api/artifacts?key=${encodeURIComponent(key)}`;

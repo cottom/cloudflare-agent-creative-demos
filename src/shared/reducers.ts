@@ -1,3 +1,4 @@
+import { getAssetKind } from "./asset-kinds";
 import type {
   ActivityEvent,
   CanvasCommand,
@@ -5,6 +6,7 @@ import type {
   MutationResult,
   PptCommand,
   PptProjectState,
+  ProjectCommand,
   ProjectMutation,
   ProjectState
 } from "./types";
@@ -106,15 +108,21 @@ export function applyCanvasCommands(state: CanvasProjectState, commands: CanvasC
   return next;
 }
 
+/**
+ * Dispatch through the asset-kind registry rather than a `kind` switch, so a
+ * new kind of asset needs no edit here.
+ */
+export function applyCommandsForKind(state: ProjectState, commands: ProjectCommand[]): ProjectState {
+  const kind = getAssetKind(state.kind);
+  if (!kind) throw new Error(`Unknown asset kind: ${state.kind}`);
+  return kind.applyCommands(state as never, commands as never) as ProjectState;
+}
+
 export function applyMutation<T extends ProjectState>(state: T, mutation: ProjectMutation, now = new Date().toISOString()): MutationResult<T> {
   if (mutation.baseRevision !== state.revision) {
     return { ok: false, code: "REVISION_CONFLICT", currentRevision: state.revision, state };
   }
   const nextRevision = state.revision + 1;
-  if (state.kind === "ppt") {
-    const next = appendActivity(applyPptCommands(state, mutation.commands as PptCommand[]), mutation, nextRevision, now);
-    return { ok: true, state: next as T, revision: nextRevision };
-  }
-  const next = appendActivity(applyCanvasCommands(state, mutation.commands as CanvasCommand[]), mutation, nextRevision, now);
-  return { ok: true, state: next as T, revision: nextRevision };
+  const reduced = applyCommandsForKind(state, mutation.commands) as T;
+  return { ok: true, state: appendActivity(reduced, mutation, nextRevision, now), revision: nextRevision };
 }

@@ -13,9 +13,11 @@ import { getProjectStub, listWorkspace, readProject, syncProjectWorkspace } from
 import { DEFAULT_IMAGE_MODEL, DEFAULT_LLM_MODEL, generateImageBytes } from "./lib/ai";
 import { savePresentationExport, saveSlideImage } from "./lib/artifacts";
 import { isServableArtifactKey } from "../shared/policy";
+import { ApiError, handleV1 } from "./platform/v1";
 import { StudioAgent, studioAgentName } from "./studio-agent";
 
 export { PptProject, CanvasProject } from "./project/project-do";
+export { Tenant } from "./platform/tenant-do";
 export { StudioAgent } from "./studio-agent";
 export { PptBuildWorkflow } from "./workflows/ppt-build";
 export { CanvasVariantsWorkflow } from "./workflows/canvas-variants";
@@ -264,6 +266,9 @@ export default {
   // loses its binding and throws "Illegal invocation" at runtime.
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
+      const v1 = await handleV1(request, env, ctx);
+      if (v1) return v1;
+
       const api = await handleApi(request, env, ctx);
       if (api) return api;
 
@@ -272,7 +277,7 @@ export default {
 
       return env.ASSETS.fetch(request);
     } catch (error) {
-      const status = error instanceof HttpError ? error.status : 500;
+      const status = error instanceof HttpError || error instanceof ApiError ? error.status : 500;
       // Structured logs are queryable in Workers Logs; a bare string is not.
       console.error(JSON.stringify({
         event: "request_failed",
@@ -284,6 +289,7 @@ export default {
       }));
       // Only deliberate HTTP errors carry a caller-facing message; anything
       // else is an internal fault and its text is not echoed back.
+      if (error instanceof ApiError) return json({ error: error.message, detail: error.detail }, status);
       if (error instanceof HttpError) return json({ error: error.message }, status);
       return json({ error: "Internal error" }, 500);
     }

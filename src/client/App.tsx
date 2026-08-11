@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
 import type {
   CanvasCommand,
   CanvasProjectState,
@@ -12,7 +12,16 @@ import type {
 } from "../shared/types";
 import { AgentPanel } from "./components/AgentPanel";
 import { CanvasStudio } from "./components/CanvasStudio";
-import { PptStudio } from "./components/PptStudio";
+import { ActivityFeed } from "./components/ActivityFeed";
+import { StudioSkeleton } from "./components/StudioSkeleton";
+
+/**
+ * PPTist is ~5 MB of editor. Imported statically it blocked first paint for
+ * 31.7s — the shell, the nav and even the loading screen all waited on it.
+ * Loading it lazily lets the app paint immediately and stream the editor in
+ * behind a skeleton.
+ */
+const PptStudio = lazy(() => import("./components/PptStudio").then((m) => ({ default: m.PptStudio })));
 import { api } from "./lib/api";
 import { usePolling } from "./lib/usePolling";
 
@@ -138,7 +147,13 @@ export default function App() {
   const activeWorkflows = useMemo(() => activeProject?.workflows.filter((workflow) => ["queued", "running", "waiting"].includes(workflow.status)).length ?? 0, [activeProject?.workflows]);
 
   if (loading || !projects || !activeProject) {
-    return <div className="loading-screen"><div className="loader-orb" /><h1>Bootstrapping durable creative projects</h1><p>Initializing Durable Objects, Agent sessions, and Computer workspaces…</p></div>;
+    return (
+      <div className="loading-screen">
+        <div className="loader-orb" />
+        <h1>Opening your projects</h1>
+        <p>Waking the Durable Objects and Agent sessions. This runs once per session.</p>
+      </div>
+    );
   }
 
   return (
@@ -153,17 +168,14 @@ export default function App() {
             <span className="demo-icon canvas">C</span><div><strong>Media Canvas Agent</strong><small>Canvas edits + real image generation</small></div>
           </button>
         </div>
-        <div className="runtime-card">
-          <span className="eyebrow">Live stack</span>
-          <div><i className="status-dot" />Cloudflare-native</div>
-          <small>Durable Objects</small><small>Agents + Think</small><small>Workflows + HITL</small><small>Workers AI</small><small>Computer Workspace</small><small>R2 artifacts</small>
-        </div>
+        <ActivityFeed activity={activeProject.activity} revision={activeProject.revision} />
         <div className="model-card"><span>LLM</span><strong>{models.llm.split("/").at(-1)}</strong><span>Image</span><strong>{models.image.split("/").at(-1)}</strong></div>
         <div className="nav-footer"><span>{activeWorkflows} active workflow{activeWorkflows === 1 ? "" : "s"}</span><span>Project rev {activeProject.revision}</span></div>
       </nav>
 
       <div className="content-shell">
         {activeKind === "ppt" ? (
+          <Suspense fallback={<StudioSkeleton kind="ppt" />}>
           <PptStudio
             project={projects.ppt}
             busy={busy}
@@ -181,6 +193,7 @@ export default function App() {
             })}
             onRefreshWorkspace={refreshWorkspace}
           />
+          </Suspense>
         ) : (
           <CanvasStudio
             project={projects.canvas}
@@ -211,7 +224,18 @@ export default function App() {
         onRejectInteraction={rejectInteraction}
       />
 
-      {error && <div className="error-toast"><strong>Action failed</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
+      {error && (
+        <div className="error-toast" role="alert">
+          <strong>That change didn’t stick</strong>
+          <span>{error}</span>
+          <div className="toast-actions">
+            <button className="text-button" onClick={() => { setError(null); void refreshProject(activeKind); }}>
+              Reload project
+            </button>
+            <button className="toast-close" aria-label="Dismiss" onClick={() => setError(null)}>×</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

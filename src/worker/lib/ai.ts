@@ -67,8 +67,8 @@ const slotSchema = z.object({
   stat: z.string().max(40).optional(),
   statLabel: z.string().max(120).optional(),
   stats: z.array(z.object({ stat: z.string().max(40), statLabel: z.string().max(120) })).max(4).optional(),
-  cards: z.array(z.object({ title: z.string().max(80), body: z.string().max(220).optional() })).max(6).optional(),
-  steps: z.array(z.object({ title: z.string().max(80), body: z.string().max(220).optional() })).max(6).optional(),
+  cards: z.array(z.object({ heading: z.string().max(80), body: z.string().max(220).optional() })).max(6).optional(),
+  steps: z.array(z.object({ heading: z.string().max(80), body: z.string().max(220).optional() })).max(6).optional(),
   headers: z.array(z.string().max(60)).max(5).optional(),
   rows: z.array(z.array(z.string().max(120)).max(5)).max(6).optional(),
   chartType: z.enum(["bar", "line", "pie"]).optional(),
@@ -140,33 +140,35 @@ export async function generateDeckPlan(
 ): Promise<DeckPlan> {
   const additionalDirection = typeof humanResponse?.direction === "string" ? humanResponse.direction : "";
   const approvedOutline = Array.isArray(humanResponse?.slides) ? humanResponse.slides : plan.slides;
-  const { object } = await generateObject({
-    model: workersLanguageModel(env),
-    schema: deckPlanSchema,
-    temperature: 0.4,
-    prompt: [
+  const basePrompt = [
       "You are a presentation designer composing slides in PPTist.",
+      `Produce EXACTLY ${Math.max(3, Math.min(params.slideCount ?? plan.slides.length ?? 8, 20))} slides — no fewer.`,
       "For each slide choose the layout recipe whose composition matches its job, then fill that layout's content slots.",
       "",
       "Layouts and their slots:",
       "- title / section / closing: title, subtitle, eyebrow",
       "- bullets: title, bullets[] (variants: standard, leftRail, rightRail)",
       "- twoColumn: title, leftHeading, leftBullets[], rightHeading, rightBullets[] (variants: even, leftWide, rightWide)",
-      "- imageText: title, bullets[] or body, caption (variants: imageRight, imageLeft) — needs an imagePrompt",
+      "- imageText: title AND bullets[] (or body), caption (variants: imageRight, imageLeft) — needs an imagePrompt. A title alone is rejected.",
       "- bigStat: stats[] of {stat,statLabel}, or stat + statLabel, title, body (variants: centered, edgeAligned)",
       "- quote: quote, attribution (variants: centered, leftHeavy)",
       "- chart: title, chartType, labels[], series[] of {name,data[]}",
-      "- comparison: title, headers[], rows[][]",
-      "- cards: title, cards[] of {title,body} (variants: grid, accentPanel, leftOffset, rightOffset)",
-      "- numbered: title, steps[] of {title,body} (variants: standard, rightRail)",
+      "- comparison: title, headers[], rows[][] — rows must be non-empty.",
+      "- cards: title, cards[] of {heading,body} (variants: grid, accentPanel, leftOffset, rightOffset)",
+      "- numbered: title, steps[] of {heading,body} (variants: standard, rightRail)",
       "- imageFull: title, subtitle — needs an imagePrompt; use it for the single most striking slide",
       "",
       "Rules:",
+      "- A layout's content slots are MANDATORY, not optional. Choosing 'cards' and leaving cards[] empty,",
+      "  or 'numbered' with no steps[], produces a slide with nothing on it but a heading. Write the content.",
+      "- If you do not have enough substance to fill a layout's slots, choose 'bullets' and write real bullets",
+      "  instead of choosing a richer layout and leaving it empty.",
       "- Vary the layout family across the deck. A deck where every slide is 'bullets' is the failure mode to avoid.",
       "- Open with 'title' and end with 'closing'.",
       "- Match the layout to the content: parallel items -> cards, ordered steps -> numbered, a headline number -> bigStat, data -> chart, a memorable line -> quote.",
       "- Write slot text as plain text or Markdown (**bold**, _italic_). NEVER write HTML tags.",
-      "- Add imagePrompt ONLY where a picture genuinely adds meaning (typically 1-3 slides). Prompts must be self-contained, describe composition, subject, lighting and mood, and must not ask for legible text in the image.",
+      "- Give the single most striking slide the 'imageFull' layout with an imagePrompt.",
+      "- Add imagePrompt to 1-3 slides total, where a picture genuinely adds meaning (imageFull or imageText). Prompts must be self-contained, describe composition, subject, lighting and mood, and must not ask for legible text in the image.",
       "- Do not invent statistics that are not in the source material.",
       "",
       `Objective: ${params.objective}`,
@@ -174,9 +176,44 @@ export async function generateDeckPlan(
       `Approved outline: ${JSON.stringify({ ...plan, slides: approvedOutline })}`,
       params.sourceNotes ? `Source notes:\n${params.sourceNotes}` : "",
       additionalDirection ? `Human direction:\n${additionalDirection}` : ""
-    ].filter(Boolean).join("\n")
+  ].filter(Boolean).join("\n");
+
+  const first = await generateObject({
+    model: workersLanguageModel(env),
+    schema: deckPlanSchema,
+    temperature: 0.4,
+    prompt: basePrompt
   });
-  return object;
+
+  const gaps = first.object.slides
+    .map((slide, index) => ({ index: index + 1, layoutId: slide.layoutId, empty: emptyRequiredSlots(slide) }))
+    .filter((entry) => entry.empty.length > 0);
+  if (!gaps.length) return first.object;
+
+  /**
+   * One feedback-driven retry.
+   *
+   * The downgrade path keeps an under-filled plan buildable, but the result is
+   * a complete deck of empty-looking slides — which reads as a bad deck rather
+   * than as a bug, and so never gets reported. Naming the specific slides and
+   * slots that were empty recovers most of them; a plan that is still worse
+   * after the retry is discarded rather than trusted.
+   */
+  console.warn(JSON.stringify({ event: "deck_plan_retry", gaps }));
+  const retry = await generateObject({
+    model: workersLanguageModel(env),
+    schema: deckPlanSchema,
+    temperature: 0.3,
+    prompt: [
+      basePrompt,
+      "",
+      "Your previous attempt left required content slots empty on these slides:",
+      ...gaps.map((gap) => `- slide ${gap.index} used layout "${gap.layoutId}" but filled none of: ${gap.empty.join(", ")}`),
+      "Produce the deck again with those slots filled with real content, or use a simpler layout you can fill."
+    ].join("\n")
+  });
+  const retryGaps = retry.object.slides.filter((slide) => emptyRequiredSlots(slide).length > 0).length;
+  return retryGaps < gaps.length ? retry.object : first.object;
 }
 
 /** Compose one authored slide into PPTist text elements on the 1000x562.5 stage. */
@@ -246,6 +283,109 @@ function escapeHtml(value: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/** Layouts whose composition requires an image slot to build at all. */
+const IMAGE_LAYOUTS = new Set(["imageText", "imageFull"]);
+
+/**
+ * Repair a deck plan before composition.
+ *
+ * The model regularly picks an image layout and then omits `imagePrompt`.
+ * PPTist cannot build `imageText`/`imageFull` without an image, so the slide
+ * fails and silently drops out of the deck — that is how a requested 7-slide
+ * deck arrived as 3. Rather than re-prompt and hope, derive a prompt from the
+ * slide's own content so the layout the model chose can actually be built.
+ */
+/**
+ * Required content slot per layout. PPTist rejects a slide whose layout has no
+ * body content, and a rejected slide silently disappears from the deck.
+ */
+const REQUIRED_SLOTS: Record<string, Array<keyof DeckPlanSlide["slots"]>> = {
+  cards: ["cards"],
+  numbered: ["steps"],
+  comparison: ["rows"],
+  chart: ["labels"],
+  bullets: ["bullets", "body"],
+  // The engine rejects imageText with a title and nothing else
+  // ("[contentEmpty] … the slide was rejected"), but either slot satisfies it.
+  imageText: ["bullets", "body"],
+  twoColumn: ["leftBullets", "leftBody", "rightBullets"],
+  quote: ["quote"],
+  bigStat: ["stats", "stat"]
+};
+
+function hasContent(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  return typeof value === "string" ? value.trim().length > 0 : value !== undefined;
+}
+
+/**
+ * Downgrade a slide whose layout cannot be built to one that can.
+ *
+ * Losing the composition the model wanted is a much smaller failure than
+ * losing the slide: a deck that silently arrives as 3 of 7 pages reads as the
+ * model writing a short deck, not as a bug.
+ */
+function ensureBuildable(slide: DeckPlanSlide): DeckPlanSlide {
+  const required = REQUIRED_SLOTS[slide.layoutId];
+  if (!required || required.some((slot) => hasContent(slide.slots[slot]))) return slide;
+
+  const salvaged = [
+    slide.slots.body,
+    ...(slide.slots.bullets ?? []),
+    ...(slide.slots.cards ?? []).map((card) => [card.heading, card.body].filter(Boolean).join(" — ")),
+    ...(slide.slots.steps ?? []).map((step) => [step.heading, step.body].filter(Boolean).join(" — ")),
+    slide.slots.subtitle
+  ].filter((line): line is string => Boolean(line && line.trim()));
+
+  if (!salvaged.length) {
+    // Nothing to say in a body — a section divider is honest and always builds.
+    return { ...slide, layoutId: "section", variantId: undefined };
+  }
+  return { ...slide, layoutId: "bullets", variantId: undefined, slots: { ...slide.slots, bullets: salvaged.slice(0, 6) } };
+}
+
+/** Slots the model left empty on a slide whose layout requires one of them. */
+function emptyRequiredSlots(slide: DeckPlanSlide): string[] {
+  const required = REQUIRED_SLOTS[slide.layoutId];
+  if (!required || required.some((slot) => hasContent(slide.slots[slot]))) return [];
+  return required as string[];
+}
+
+export function repairDeckPlan(plan: DeckPlan): DeckPlan {
+  // A downgrade is invisible in the finished deck — it just looks like a plain
+  // slide the model chose — so the fact that one happened is logged. Repeated
+  // downgrades mean the generation prompt is failing, not the composer.
+  const downgraded = plan.slides
+    .map((slide, index) => ({ index: index + 1, layoutId: slide.layoutId, empty: emptyRequiredSlots(slide) }))
+    .filter((entry) => entry.empty.length > 0);
+  if (downgraded.length) {
+    console.warn(JSON.stringify({
+      event: "deck_plan_downgraded",
+      slides: plan.slides.length,
+      downgradedCount: downgraded.length,
+      downgraded
+    }));
+  }
+
+  return {
+    ...plan,
+    slides: plan.slides.map((original) => {
+      const slide = ensureBuildable(original);
+      if (!IMAGE_LAYOUTS.has(slide.layoutId) || slide.imagePrompt) return slide;
+      const subject = slide.slots.title ?? slide.slots.subtitle ?? plan.title;
+      return {
+        ...slide,
+        imagePrompt: [
+          `Editorial photograph illustrating: ${subject}.`,
+          `Context: ${plan.objective}.`,
+          "Cinematic lighting, shallow depth of field, muted professional palette,",
+          "generous negative space for overlaid text, no words or lettering in the image."
+        ].join(" ")
+      };
+    })
+  };
 }
 
 export async function generateCanvasDirections(

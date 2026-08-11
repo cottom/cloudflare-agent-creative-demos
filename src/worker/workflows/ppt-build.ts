@@ -10,7 +10,7 @@ import type {
   WorkflowProgressPayload
 } from "../../shared/types";
 import type { StudioAgent } from "../studio-agent";
-import { generateDeckPlan, generateImageBytes, generatePptPlan, type DeckPlan } from "../lib/ai";
+import { generateDeckPlan, generateImageBytes, generatePptPlan, repairDeckPlan, type DeckPlan } from "../lib/ai";
 import { artifactUrl, saveSlideImage } from "../lib/artifacts";
 import { composeDeckHeadless } from "../lib/compose-deck";
 import type { PptistDocument } from "../../shared/pptist";
@@ -64,7 +64,7 @@ export class PptBuildWorkflow extends AgentWorkflow<StudioAgent, PptBuildWorkflo
     const deckPlan = await step.do("generate-deck-plan", {
       retries: { limit: 3, delay: "5 seconds", backoff: "exponential" },
       timeout: "8 minutes"
-    }, async (): Promise<DeckPlan> => generateDeckPlan(this.env, params, plan, response));
+    }, async (): Promise<DeckPlan> => repairDeckPlan(await generateDeckPlan(this.env, params, plan, response)));
 
     // The model decides which slides earn a picture, so only those cost a
     // generation. Bounded concurrency keeps Workers AI load predictable.
@@ -144,8 +144,29 @@ export class PptBuildWorkflow extends AgentWorkflow<StudioAgent, PptBuildWorkflo
       timeout: "5 minutes"
     }, async (): Promise<ExportArtifact> => this.agent.exportCurrentPpt());
 
-    const result = { projectId: params.projectId, revision, slideCount: document.deck.slides.length, artifact };
-    await this.reportProgress({ step: "complete", status: "complete", percent: 1, message: "Presentation and PPTX are ready" });
+    const requestedSlides = deckPlan.slides.length;
+    const builtSlides = composed.deck.slides.length;
+    const imagesRequested = imageTargets.length;
+    const imagesMade = Object.keys(imageUrls).length;
+    const result = {
+      projectId: params.projectId,
+      revision,
+      slideCount: builtSlides,
+      requestedSlides,
+      imagesRequested,
+      imagesMade,
+      qaWarnings: composed.warnings.slice(0, 20),
+      artifact
+    };
+    await this.reportProgress({
+      step: "complete", status: "complete", percent: 1,
+      // A partially-illustrated deck must not read as a clean success.
+      message: builtSlides < requestedSlides
+        ? `Deck ready — ${builtSlides}/${requestedSlides} slides composed (see QA warnings)`
+        : imagesMade < imagesRequested
+          ? `Deck ready — ${imagesMade}/${imagesRequested} images generated`
+          : "Presentation and PPTX are ready"
+    });
     await step.reportComplete(result);
     return result;
   }

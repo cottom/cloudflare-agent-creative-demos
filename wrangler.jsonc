@@ -21,17 +21,27 @@
   "assets": {
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/agents/*"]
+    "run_worker_first": ["/api/*", "/v1/*", "/agents/*"]
   },
   "durable_objects": {
     "bindings": [
       { "name": "PPT_PROJECT", "class_name": "PptProject" },
       { "name": "CANVAS_PROJECT", "class_name": "CanvasProject" },
-      { "name": "STUDIO_AGENT", "class_name": "StudioAgent" }
+      { "name": "STUDIO_AGENT", "class_name": "StudioAgent" },
+      { "name": "TENANT", "class_name": "Tenant" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["PptProject", "CanvasProject", "StudioAgent"] }
+    { "tag": "v1", "new_sqlite_classes": ["PptProject", "CanvasProject", "StudioAgent"] },
+    { "tag": "v2", "new_sqlite_classes": ["Tenant"] }
+  ],
+  // Keyed by tenant, not IP: this is a server-to-server API where one
+  // integrator's traffic all shares an address. Reads are far cheaper than
+  // writes (which fan out to AI inference and workflows), so they get separate
+  // budgets rather than one shared ceiling.
+  "ratelimits": [
+    { "name": "READ_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 600, "period": 60 } },
+    { "name": "WRITE_RATE_LIMITER", "namespace_id": "1002", "simple": { "limit": 120, "period": 60 } }
   ],
   "workflows": [
     { "name": "PPT_BUILD_WORKFLOW", "binding": "PPT_BUILD_WORKFLOW", "class_name": "PptBuildWorkflow" },

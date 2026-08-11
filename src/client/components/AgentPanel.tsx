@@ -22,6 +22,27 @@ type Props = {
   onRejectInteraction: (sessionId: string, interactionId: string, reason: string) => Promise<void>;
 };
 
+/** Distinguish same-named sessions without making the pill unreadable. */
+function sessionLabel(session: SessionMeta, index: number): string {
+  const title = session.title.trim();
+  const generic = /^(new .*agent session|main agent session)$/i.test(title);
+  if (!generic) return title.length > 18 ? `${title.slice(0, 17)}…` : title;
+  return index === 0 ? "Current session" : `Session ${index + 1}`;
+}
+
+/** Human-readable name for the selected object, falling back to a short id. */
+function selectionLabel(project: ProjectState, id: string): string {
+  if (project.kind === "canvas") {
+    const node = project.document.nodes.find((item) => item.id === id);
+    if (node) return node.title || node.type;
+  }
+  const slideIndex = project.kind === "ppt"
+    ? project.document.deck.slides.findIndex((slide) => slide.id === id)
+    : -1;
+  if (slideIndex >= 0) return `slide ${slideIndex + 1}`;
+  return `${id.slice(0, 8)}…`;
+}
+
 /** The tool whose input is an interactive UI spec for the client to render. */
 const UI_TOOL_PART = "tool-ask_user";
 
@@ -30,7 +51,11 @@ export function AgentPanel(props: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const currentSession = props.project.sessions.find((session) => session.id === props.activeSessionId);
   const interactions = props.project.interactions.filter((interaction) => interaction.status === "pending");
-  const workflows = props.project.workflows.slice(0, 4);
+  // Only work still in flight belongs here. Finished runs are in the project
+  // history feed, so repeating them turns the action area into noise.
+  const workflows = props.project.workflows
+    .filter((workflow) => ["queued", "running", "waiting"].includes(workflow.status))
+    .slice(0, 3);
 
   // One WebSocket per Agent session. `name` must match the worker's own
   // convention exactly, which is why it comes from shared code.
@@ -51,6 +76,14 @@ export function AgentPanel(props: Props) {
   });
 
   const streaming = isStreaming || status === "streaming" || status === "submitted";
+
+  // Sessions accumulate over a demo and mostly share a default name. Keep the
+  // active one plus the few most recent, and count the rest.
+  const ordered = [...props.project.sessions].sort((a, b) =>
+    a.id === props.activeSessionId ? -1 : b.id === props.activeSessionId ? 1 : 0
+  );
+  const visibleSessions = ordered.slice(0, 4);
+  const hiddenSessionCount = ordered.length - visibleSessions.length;
 
   // The agent's tools mutate the project, so refresh it once a turn settles.
   const settledCount = streaming ? -1 : messages.length;
@@ -88,19 +121,25 @@ export function AgentPanel(props: Props) {
           <span className="eyebrow">Project Agent</span>
           <h2>{currentSession?.title ?? "Agent Session"}</h2>
         </div>
-        <button className="icon-button" title="New session" onClick={() => void props.onCreateSession()}>＋</button>
+        <button className="icon-button" title="New session" aria-label="Start a new agent session" onClick={() => void props.onCreateSession()}>＋</button>
       </header>
 
-      <div className="session-strip">
-        {props.project.sessions.map((session: SessionMeta) => (
+      <div className="session-strip" role="tablist" aria-label="Agent sessions">
+        {visibleSessions.map((session: SessionMeta, index: number) => (
           <button
             key={session.id}
             className={session.id === props.activeSessionId ? "session-pill active" : "session-pill"}
+            role="tab"
+            aria-selected={session.id === props.activeSessionId}
+            title={session.title}
             onClick={() => props.onSelectSession(session.id)}
           >
-            {session.title}
+            {sessionLabel(session, index)}
           </button>
         ))}
+        {hiddenSessionCount > 0 && (
+          <span className="session-more" title={`${hiddenSessionCount} older sessions`}>+{hiddenSessionCount}</span>
+        )}
       </div>
 
       {workflows.length > 0 && (
@@ -114,7 +153,7 @@ export function AgentPanel(props: Props) {
         </div>
       )}
 
-      <div className="chat-scroll" ref={scrollRef}>
+      <div className="chat-scroll" ref={scrollRef} role="log" aria-live="polite" aria-label="Conversation">
         {messages.length === 0 && !streaming && (
           <div className="chat-empty">
             <div className="agent-orb">AI</div>
@@ -151,7 +190,14 @@ export function AgentPanel(props: Props) {
       </div>
 
       <form className="chat-form" onSubmit={submit}>
-        {props.awareness?.activeId && <div className="selection-context">Editing context: {props.awareness.activeId}</div>}
+        {props.awareness?.activeId && (
+          <div className="selection-context">
+            {/* The raw id is the agent's handle, not the user's — show what they
+                actually selected and keep the id in the tooltip for debugging. */}
+            <i />Agent is looking at <strong>{selectionLabel(props.project, props.awareness.activeId)}</strong>
+            <span title={props.awareness.activeId} aria-hidden>ⓘ</span>
+          </div>
+        )}
         <textarea
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
@@ -211,8 +257,20 @@ function MessageBubble({
       {message.parts.map((part, index) => {
         if (part.type !== UI_TOOL_PART) return null;
         const source = part as { toolCallId?: string; state?: string; input?: unknown; output?: unknown };
+        // A spec the client cannot render must still say so. Returning null
+        // here is what made the agent look like it had hung.
+        if (!source.toolCallId) return null;
         const spec = parseUiSpec(source.input);
-        if (!spec || !source.toolCallId) return null;
+        if (!spec) {
+          return (
+            <div key={`${message.id}-ui-${index}`} className="generative-slot">
+              <section className="generative-card invalid">
+                <div className="interaction-kicker">Couldn’t render this card</div>
+                <p>The agent asked a question this app can’t display. Ask it to rephrase, or answer in the chat.</p>
+              </section>
+            </div>
+          );
+        }
         const answered = source.state === "output-available" || source.state === "output-error";
         return (
           <div key={`${message.id}-ui-${index}`} className="generative-slot">

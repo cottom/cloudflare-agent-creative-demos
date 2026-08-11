@@ -1,12 +1,8 @@
 import { withWorkspace, type WorkspaceOptions } from "@cloudflare/computer";
 import { DurableObject } from "cloudflare:workers";
 import { applyMutation } from "../../shared/reducers";
-import {
-  pptistDeckFromLegacy,
-  pptistSlideTitle,
-  PPTIST_VIEWPORT_RATIO,
-  PPTIST_VIEWPORT_SIZE
-} from "../../shared/pptist";
+import { pptistDeckFromLegacy } from "../../shared/pptist";
+import { getAssetKind } from "../../shared/asset-kinds";
 import { createInitialCanvasState, createInitialPptState } from "../../shared/seeds";
 import type {
   CanvasProjectState,
@@ -241,66 +237,24 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
     });
   }
 
+  /**
+   * Compact project view for the agent's context window.
+   *
+   * The shape comes from the asset-kind registry, so a new kind describes
+   * itself to the agent without this object learning about it.
+   */
   async getAgentContext(selection?: { ids?: string[]; activeId?: string }): Promise<string> {
     const state = await this.ensureState();
-    const selectedIds = new Set(selection?.ids ?? (selection?.activeId ? [selection.activeId] : []));
-    if (state.kind === "ppt") {
-      const deck = state.document.deck;
-      const selected = selectedIds.size
-        ? deck.slides.filter((slide) => selectedIds.has(slide.id))
-        : [];
-      return JSON.stringify({
-        project: {
-          id: state.id,
-          kind: state.kind,
-          name: state.name,
-          revision: state.revision,
-          title: state.document.title,
-          objective: state.document.objective,
-          audience: state.document.audience,
-          // The deck is PPTist's model. Only a summary is sent: full element
-          // JSON would dominate the context, and the agent reads live detail
-          // through the PPTist bridge instead.
-          editor: "pptist",
-          viewport: { width: PPTIST_VIEWPORT_SIZE, ratio: PPTIST_VIEWPORT_RATIO },
-          theme: deck.theme,
-          slideCount: deck.slides.length,
-          slides: deck.slides.map((slide, index) => ({
-            index: index + 1,
-            id: slide.id,
-            type: slide.type,
-            title: pptistSlideTitle(slide),
-            elementCount: slide.elements.length,
-            elementTypes: [...new Set(slide.elements.map((element) => element.type))],
-            remark: slide.remark?.slice(0, 200)
-          }))
-        },
-        selection: selected.map((slide) => ({ id: slide.id, title: pptistSlideTitle(slide) }))
-      });
-    }
-    const selected = selectedIds.size ? state.document.nodes.filter((node) => selectedIds.has(node.id)) : [];
+    const kind = getAssetKind(state.kind);
+    if (!kind) return JSON.stringify({ project: null, note: `Unknown asset kind: ${state.kind}` });
     return JSON.stringify({
       project: {
         id: state.id,
         kind: state.kind,
         name: state.name,
         revision: state.revision,
-        title: state.document.title,
-        canvas: { width: state.document.width, height: state.document.height, background: state.document.background },
-        nodes: state.document.nodes.map((node) => ({
-          id: node.id,
-          type: node.type,
-          title: node.title,
-          text: node.text,
-          prompt: node.prompt,
-          status: node.status,
-          x: node.x,
-          y: node.y,
-          width: node.width,
-          height: node.height
-        }))
-      },
-      selection: selected
+        ...kind.summarizeForAgent(state as never, selection ?? {})
+      }
     });
   }
 
