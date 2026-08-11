@@ -16,8 +16,10 @@ import {
 } from "./auth";
 import { resolvePrincipal } from "./principal";
 import { getWorkflow, listWorkflows, validateWorkflowParams, workflowsForKind } from "./workflows";
+import { artifactKeyBelongsToTenant } from "../../shared/policy";
+import { generateDeckPlan } from "../lib/ai";
 import { StudioAgent, studioAgentName } from "../studio-agent";
-import type { EditorAwareness, JsonObject, ProjectKind, ProjectMutation } from "../../shared/types";
+import type { EditorAwareness, JsonObject, PptBuildWorkflowParams, ProjectKind, ProjectMutation } from "../../shared/types";
 
 /**
  * Versioned, tenant-scoped API.
@@ -191,6 +193,57 @@ export async function handleV1(request: Request, env: Env, ctx: ExecutionContext
       const tenantId = validId(decodeURIComponent(parts[2]), "tenant id");
       return json(await tenantStub(env, tenantId).stats());
     }
+
+    /**
+     * Run deck planning alone and return the raw plan.
+     *
+     * The planning step sits behind a human approval gate inside a workflow, so
+     * the only way to see what the model actually produced was a five-minute
+     * round trip — which is how a deck full of empty content slots stayed
+     * misdiagnosed for three attempts. This exposes the same call directly.
+     */
+    if (parts[1] === "dry-run" && parts[2] === "deck-plan" && method === "POST") {
+      const body = await readJson<{ objective: string; audience?: string; slideCount?: number }>(request);
+      if (!body.objective?.trim()) throw new ApiError(400, "objective is required");
+      const params = {
+        projectId: "dry-run",
+        sessionId: "dry-run",
+        objective: body.objective,
+        audience: body.audience,
+        slideCount: body.slideCount
+      } as PptBuildWorkflowParams;
+      // Synthesised outline rather than a real planning call: this route exists
+      // to inspect slot filling, and a third model call does not fit the
+      // request budget.
+      const outline = {
+        title: body.objective.slice(0, 80),
+        objective: body.objective,
+        audience: body.audience ?? "business decision makers",
+        styleId: "minimal",
+        slides: []
+      } as unknown as Parameters<typeof generateDeckPlan>[2];
+      // Measured caveat: a request handler is cut off near 126s and planning
+      // alone costs ~60s against this model, so decks past ~3 slides time out
+      // here even though they complete inside a workflow step. Inspect shape
+      // with this route, not throughput.
+      // Full path including the slot-fill pass. The fills run concurrently, so
+      // a small deck stays inside a single request's budget; large ones belong
+      // in the workflow, which is where the real path runs them.
+      const diagnostics: string[] = [];
+      const deckPlan = await generateDeckPlan(env, params, outline, undefined, { diagnostics });
+      return json({
+        diagnostics,
+        slides: deckPlan.slides.map((slide, index) => ({
+          index: index + 1,
+          layoutId: slide.layoutId,
+          filledSlots: Object.entries(slide.slots)
+            .filter(([, value]) => (Array.isArray(value) ? value.length > 0 : Boolean(value)))
+            .map(([name]) => name),
+          hasImagePrompt: Boolean(slide.imagePrompt)
+        })),
+        raw: deckPlan
+      });
+    }
     throw new ApiError(404, "Unknown admin route");
   }
 
@@ -208,6 +261,45 @@ export async function handleV1(request: Request, env: Env, ctx: ExecutionContext
       via: principal.via,
       ...(principal.projectId ? { pinnedTo: { kind: principal.kind, projectId: principal.projectId } } : {})
     });
+  }
+
+  /**
+   * Authorised artifact reads.
+   *
+   * The demo plane serves any well-formed key to anyone, on the theory that
+   * keys are unguessable — which is not the same as authorised. Here the key
+   * must carry the caller's own tenant segment, so a leaked key is still
+   * useless to a different tenant.
+   */
+  if (parts[0] === "artifacts" && method === "GET") {
+    requireScope(principal, "projects:read");
+    const key = url.searchParams.get("key");
+    if (!key) throw new ApiError(400, "Missing artifact key");
+    if (!artifactKeyBelongsToTenant(key, principal.tenantId)) throw new ApiError(404, "Artifact not found");
+    // A pinned principal is narrowed further, to its own project's keys.
+    if (principal.projectId && principal.kind) {
+      const prefix = requireAssetKind(principal.kind).artifactPrefix;
+      const owner = projectObjectName(principal.tenantId, principal.kind, principal.projectId);
+      if (!key.startsWith(`${prefix}/${owner}/`)) {
+        throw new ApiError(403, "This token is scoped to a different project");
+      }
+    }
+    const object = await env.ARTIFACTS.get(key, { onlyIf: request.headers });
+    if (!object) throw new ApiError(404, "Artifact not found");
+    const headers = new Headers();
+    object.writeHttpMetadata(headers);
+    headers.set("etag", object.httpEtag);
+    // Keys embed a revision or workflow id, so a key's bytes never change.
+    // Private, because the response is now authorisation-dependent.
+    headers.set("cache-control", "private, max-age=31536000, immutable");
+    if (url.searchParams.get("download") === "1") {
+      const filename = (key.split("/").at(-1) ?? "artifact").replace(/["\\\r\n]/g, "");
+      headers.set("content-disposition", `attachment; filename="${filename}"`);
+    }
+    if (!("body" in object)) {
+      return new Response(null, { status: request.headers.has("if-none-match") ? 304 : 412, headers });
+    }
+    return new Response(object.body, { headers });
   }
 
   if (parts[0] !== "projects") throw new ApiError(404, "Unknown v1 route");
@@ -243,7 +335,14 @@ export async function handleV1(request: Request, env: Env, ctx: ExecutionContext
     });
     // Index first, then materialise the document object. The reverse order can
     // leave an addressable project that no listing will ever return.
-    await projectStub(env, principal, kind, projectId).initialize(projectId);
+    //
+    // Seeded with the *composed* name, not the bare id: the project's own id
+    // becomes the middle segment of every artifact key it writes
+    // (`ppt/<state.id>/revision-3.pptx`). Seeding it bare would put two tenants
+    // that both chose the id "deck-1" on the same R2 key.
+    await projectStub(env, principal, kind, projectId).initialize(
+      projectObjectName(principal.tenantId, kind, projectId)
+    );
     return json(record, 201);
   }
 

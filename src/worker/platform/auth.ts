@@ -164,12 +164,25 @@ export async function verifyEmbedToken(secret: string, token: string, now = Date
   }
 }
 
-export function bearerToken(request: Request): string | null {
+export type PresentedToken = { value: string; source: "header" | "query" };
+
+/**
+ * Extract the presented credential and remember where it came from.
+ *
+ * Query strings end up in access logs, `Referer` headers and browser history,
+ * so a credential in one should be assumed recorded. That is tolerable for an
+ * embed token — short-lived and pinned to a single project — and not tolerable
+ * for an API key, so the caller rejects keys presented this way. Embedded
+ * editors cannot set headers on a WebSocket upgrade or an `<iframe>`
+ * navigation, which is the only reason the query path exists at all.
+ */
+export function bearerToken(request: Request): PresentedToken | null {
   const header = request.headers.get("authorization");
-  if (header?.toLowerCase().startsWith("bearer ")) return header.slice(7).trim();
-  // Embedded editors cannot set headers on a WebSocket upgrade or an <iframe>
-  // navigation, so a query token is accepted for those paths only.
-  return new URL(request.url).searchParams.get("token");
+  if (header?.toLowerCase().startsWith("bearer ")) {
+    return { value: header.slice(7).trim(), source: "header" };
+  }
+  const query = new URL(request.url).searchParams.get("token");
+  return query ? { value: query, source: "query" } : null;
 }
 
 export function hasScope(principal: Principal, scope: Scope): boolean {

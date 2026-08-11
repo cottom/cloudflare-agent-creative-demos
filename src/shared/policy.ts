@@ -27,11 +27,27 @@ export function staleRevisionFiles(names: string[], limit = REVISION_HISTORY_LIM
 }
 
 /**
- * The artifact endpoint is unauthenticated and takes a caller-supplied key, so
- * reads are confined to the prefixes this app actually writes.
+ * The artifact endpoint takes a caller-supplied key, so reads are confined to
+ * the prefixes this app actually writes.
+ *
+ * ":" is permitted because a tenant-scoped project's id is its composed object
+ * name, which appears as the second key segment.
  */
 export function isServableArtifactKey(key: string): boolean {
-  return /^(ppt|canvas)\/[\w./-]+$/.test(key) && !key.includes("..");
+  return /^(ppt|canvas)\/[\w.:/-]+$/.test(key) && !key.includes("..");
+}
+
+/**
+ * Whether an artifact key belongs to a tenant.
+ *
+ * Keys are `<prefix>/<projectId>/…`, and a tenant-scoped project's id begins
+ * with its own tenant segment. Demo-plane keys have a bare project id and no
+ * tenant segment, so they match no tenant and are unreachable from `/v1`.
+ */
+export function artifactKeyBelongsToTenant(key: string, tenantId: string): boolean {
+  if (!isServableArtifactKey(key)) return false;
+  const projectSegment = key.split("/")[1] ?? "";
+  return projectSegment.startsWith(`${tenantId}:`);
 }
 
 /**

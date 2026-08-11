@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  bearerToken,
   canAccessProject,
   generateApiKey,
   hasScope,
@@ -18,6 +19,7 @@ import {
   workflowsForKind
 } from "../src/worker/platform/workflows";
 import { projectObjectName } from "../src/shared/asset-kinds";
+import { artifactKeyBelongsToTenant } from "../src/shared/policy";
 
 const SECRET = "test-embed-secret";
 
@@ -178,5 +180,49 @@ describe("workflow registry", () => {
 
   it("accepts a valid request without the optional fields", () => {
     expect(validateWorkflowParams(getWorkflow("ppt-build")!, { brief: "Quarterly review" }).ok).toBe(true);
+  });
+});
+
+describe("artifact key ownership", () => {
+  it("accepts a key whose project segment carries the tenant", () => {
+    expect(artifactKeyBelongsToTenant("ppt/acme:ppt:deck-1/revision-3.pptx", "acme")).toBe(true);
+  });
+
+  it("rejects another tenant's key", () => {
+    expect(artifactKeyBelongsToTenant("ppt/globex:ppt:deck-1/revision-3.pptx", "acme")).toBe(false);
+  });
+
+  it("rejects a tenant that is only a prefix of the owning tenant", () => {
+    // "acme" must not match "acme-corp:…" — the separator is part of the test.
+    expect(artifactKeyBelongsToTenant("ppt/acme-corp:ppt:deck-1/x.pptx", "acme")).toBe(false);
+  });
+
+  it("rejects demo-plane keys, which carry no tenant segment", () => {
+    expect(artifactKeyBelongsToTenant("ppt/ppt-demo/revision-1.pptx", "acme")).toBe(false);
+  });
+
+  it("rejects traversal and foreign prefixes before checking ownership", () => {
+    expect(artifactKeyBelongsToTenant("ppt/acme:ppt:d/../../secret", "acme")).toBe(false);
+    expect(artifactKeyBelongsToTenant("secrets/acme:ppt:d/x", "acme")).toBe(false);
+  });
+});
+
+describe("credential presentation", () => {
+  const request = (url: string, headers?: Record<string, string>) => new Request(url, { headers });
+
+  it("reads a bearer header and marks its source", () => {
+    const token = bearerToken(request("https://x/v1/whoami", { authorization: "Bearer cak_abc_def" }));
+    expect(token).toEqual({ value: "cak_abc_def", source: "header" });
+  });
+
+  it("reads a query token for header-less transports", () => {
+    expect(bearerToken(request("https://x/agents/chat?token=embed.sig"))).toEqual({
+      value: "embed.sig",
+      source: "query"
+    });
+  });
+
+  it("returns null when no credential is presented", () => {
+    expect(bearerToken(request("https://x/v1/whoami"))).toBeNull();
   });
 });

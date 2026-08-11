@@ -103,6 +103,106 @@ const deckPlanSchema = z.object({
 export type DeckPlan = z.infer<typeof deckPlanSchema>;
 export type DeckPlanSlide = DeckPlan["slides"][number];
 
+/**
+ * Per-layout schemas whose content fields are REQUIRED.
+ *
+ * `slotSchema` has 27 fields and every one is optional, which makes
+ * `{layoutId: "cards", slots: {title: "…"}}` perfectly valid. Structured
+ * output takes that offer: measured against the live model, a single planning
+ * call filled `title` on every slide and nothing else, for every layout. The
+ * composer then had no content to place, and the repair pass downgraded each
+ * slide to a bare divider — a complete deck of empty slides.
+ *
+ * Prompt wording cannot fix a schema that says content is optional. So slots
+ * are filled by a second, per-slide call against a schema small enough to hold
+ * in attention and strict enough that an empty answer fails validation and is
+ * retried by the SDK rather than accepted.
+ */
+const FILL_SCHEMAS: Record<string, z.ZodType> = {
+  bullets: z.object({ bullets: z.array(z.string().min(8).max(200)).min(3).max(6) }),
+  imageText: z.object({ bullets: z.array(z.string().min(8).max(200)).min(2).max(4) }),
+  cards: z.object({
+    cards: z.array(z.object({ heading: z.string().min(2).max(80), body: z.string().min(10).max(220) })).min(3).max(4)
+  }),
+  numbered: z.object({
+    steps: z.array(z.object({ heading: z.string().min(2).max(80), body: z.string().min(10).max(220) })).min(3).max(5)
+  }),
+  comparison: z.object({
+    headers: z.array(z.string().min(1).max(60)).min(2).max(4),
+    rows: z.array(z.array(z.string().min(1).max(120)).min(2).max(4)).min(2).max(5)
+  }),
+  twoColumn: z.object({
+    leftHeading: z.string().min(2).max(120),
+    leftBullets: z.array(z.string().min(8).max(200)).min(2).max(4),
+    rightHeading: z.string().min(2).max(120),
+    rightBullets: z.array(z.string().min(8).max(200)).min(2).max(4)
+  }),
+  bigStat: z.object({
+    stats: z.array(z.object({ stat: z.string().min(1).max(40), statLabel: z.string().min(3).max(120) })).min(1).max(3)
+  }),
+  quote: z.object({
+    quote: z.string().min(20).max(320),
+    attribution: z.string().min(2).max(120)
+  }),
+  chart: z.object({
+    chartType: z.enum(["bar", "line", "pie"]),
+    labels: z.array(z.string().min(1).max(40)).min(3).max(8),
+    series: z.array(z.object({ name: z.string().min(1).max(40), data: z.array(z.number()).min(3).max(8) })).min(1).max(3)
+  }),
+  title: z.object({ subtitle: z.string().min(10).max(240), eyebrow: z.string().min(2).max(60) }),
+  section: z.object({ subtitle: z.string().min(10).max(240) }),
+  closing: z.object({ subtitle: z.string().min(10).max(240), eyebrow: z.string().min(2).max(60) }),
+  imageFull: z.object({ subtitle: z.string().min(10).max(240) })
+};
+
+/**
+ * Fill one slide's content slots against its own layout's schema.
+ *
+ * Returns the slide unchanged on failure. A slide that keeps its title is
+ * worth more than a workflow that dies because one of twelve calls came back
+ * malformed, and the downgrade path still catches whatever stays empty.
+ */
+async function fillSlideSlots(
+  env: Env,
+  plan: DeckPlan,
+  slide: DeckPlanSlide,
+  diagnostics?: string[]
+): Promise<DeckPlanSlide> {
+  const schema = FILL_SCHEMAS[slide.layoutId];
+  if (!schema) {
+    diagnostics?.push(`${slide.layoutId}: no fill schema`);
+    return slide;
+  }
+  try {
+    const { object } = await generateObject({
+      model: workersLanguageModel(env),
+      schema,
+      // Fail fast. The SDK's default retry budget multiplies a schema this
+      // model struggles with into minutes of wall clock, and a slide that
+      // cannot be filled should fall back immediately, not stall the deck.
+      maxRetries: 1,
+      temperature: 0.5,
+      prompt: [
+        `You are writing the content of one slide in a presentation titled "${plan.title}".`,
+        `Deck objective: ${plan.objective}`,
+        `Audience: ${plan.audience}`,
+        `This slide's heading: ${slide.slots.title ?? "(untitled)"}`,
+        slide.notes ? `Speaker intent: ${slide.notes}` : "",
+        "",
+        `Write the content for a "${slide.layoutId}" slide. Every field is required.`,
+        "Be specific and substantive — no placeholders, no restating the heading.",
+        "Plain text or Markdown (**bold**, _italic_). Never HTML."
+      ].filter(Boolean).join("\n")
+    });
+    return { ...slide, slots: { ...slide.slots, ...(object as object) } };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(JSON.stringify({ event: "slide_fill_failed", layoutId: slide.layoutId, error: message }));
+    diagnostics?.push(`${slide.layoutId}: ${message.slice(0, 300)}`);
+    return slide;
+  }
+}
+
 const canvasDirectionsSchema = z.object({
   campaignName: z.string().min(2).max(100),
   directions: z.array(z.object({
@@ -136,7 +236,13 @@ export async function generateDeckPlan(
   env: Env,
   params: PptBuildWorkflowParams,
   plan: PptPlan,
-  humanResponse?: Record<string, unknown>
+  humanResponse?: Record<string, unknown>,
+  /**
+   * `singleShot` skips the repair round trip. Two sequential model calls fit
+   * comfortably inside a durable workflow step but not inside a single fetch
+   * handler, which is what the diagnostic route runs in.
+   */
+  options?: { singleShot?: boolean; diagnostics?: string[] }
 ): Promise<DeckPlan> {
   const additionalDirection = typeof humanResponse?.direction === "string" ? humanResponse.direction : "";
   const approvedOutline = Array.isArray(humanResponse?.slides) ? humanResponse.slides : plan.slides;
@@ -178,6 +284,16 @@ export async function generateDeckPlan(
       additionalDirection ? `Human direction:\n${additionalDirection}` : ""
   ].filter(Boolean).join("\n");
 
+  if (options?.singleShot) {
+    const only = await generateObject({
+      model: workersLanguageModel(env),
+      schema: deckPlanSchema,
+      temperature: 0.4,
+      prompt: basePrompt
+    });
+    return only.object;
+  }
+
   const first = await generateObject({
     model: workersLanguageModel(env),
     schema: deckPlanSchema,
@@ -185,35 +301,22 @@ export async function generateDeckPlan(
     prompt: basePrompt
   });
 
-  const gaps = first.object.slides
-    .map((slide, index) => ({ index: index + 1, layoutId: slide.layoutId, empty: emptyRequiredSlots(slide) }))
-    .filter((entry) => entry.empty.length > 0);
-  if (!gaps.length) return first.object;
-
   /**
-   * One feedback-driven retry.
+   * Second pass: fill each slide's content against its own layout's schema.
    *
-   * The downgrade path keeps an under-filled plan buildable, but the result is
-   * a complete deck of empty-looking slides — which reads as a bad deck rather
-   * than as a bug, and so never gets reported. Naming the specific slides and
-   * slots that were empty recovers most of them; a plan that is still worse
-   * after the retry is discarded rather than trusted.
+   * Run concurrently because the slides are independent, and the wall clock of
+   * one planning call plus the slowest fill is what the workflow step pays —
+   * not the sum of a dozen sequential calls.
    */
-  console.warn(JSON.stringify({ event: "deck_plan_retry", gaps }));
-  const retry = await generateObject({
-    model: workersLanguageModel(env),
-    schema: deckPlanSchema,
-    temperature: 0.3,
-    prompt: [
-      basePrompt,
-      "",
-      "Your previous attempt left required content slots empty on these slides:",
-      ...gaps.map((gap) => `- slide ${gap.index} used layout "${gap.layoutId}" but filled none of: ${gap.empty.join(", ")}`),
-      "Produce the deck again with those slots filled with real content, or use a simpler layout you can fill."
-    ].join("\n")
-  });
-  const retryGaps = retry.object.slides.filter((slide) => emptyRequiredSlots(slide).length > 0).length;
-  return retryGaps < gaps.length ? retry.object : first.object;
+  const draft = first.object;
+  const filled = await Promise.all(
+    draft.slides.map((slide) => fillSlideSlots(env, draft, slide, options?.diagnostics))
+  );
+  const stillEmpty = filled.filter((slide) => emptyRequiredSlots(slide).length > 0).length;
+  if (stillEmpty) {
+    console.warn(JSON.stringify({ event: "deck_plan_slots_unfilled", slides: filled.length, stillEmpty }));
+  }
+  return { ...draft, slides: filled };
 }
 
 /** Compose one authored slide into PPTist text elements on the 1000x562.5 stage. */

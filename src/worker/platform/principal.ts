@@ -61,10 +61,15 @@ function tenantStub(env: Env, tenantId: string) {
 }
 
 export async function resolvePrincipal(request: Request, env: Env, now = Date.now()): Promise<Principal | null> {
-  const token = bearerToken(request);
-  if (!token) return null;
+  const presented = bearerToken(request);
+  if (!presented) return null;
+  const token = presented.value;
 
   if (token.startsWith("cak_")) {
+    // A long-lived key in a query string should be assumed logged. The query
+    // path exists for embedded editors, which use short-lived pinned tokens;
+    // an API key presented that way is refused rather than merely discouraged.
+    if (presented.source === "query") return null;
     const cached = cacheGet(token, now);
     if (cached) return cached;
     const tenantId = tenantFromApiKey(token);
