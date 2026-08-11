@@ -210,16 +210,19 @@ describe("artifact key ownership", () => {
 describe("credential presentation", () => {
   const request = (url: string, headers?: Record<string, string>) => new Request(url, { headers });
 
-  it("reads a bearer header and marks its source", () => {
-    const token = bearerToken(request("https://x/v1/whoami", { authorization: "Bearer cak_abc_def" }));
-    expect(token).toEqual({ value: "cak_abc_def", source: "header" });
+  it("reads a bearer header", () => {
+    expect(bearerToken(request("https://x/v1/whoami", { authorization: "Bearer cak_abc_def" }))).toBe("cak_abc_def");
   });
 
-  it("reads a query token for header-less transports", () => {
-    expect(bearerToken(request("https://x/agents/chat?token=embed.sig"))).toEqual({
-      value: "embed.sig",
-      source: "query"
-    });
+  it("ignores a credential in the query string", () => {
+    // Query strings are recorded in access logs, Referer headers and history.
+    // The embedded editor receives its token over postMessage instead, so no
+    // caller needs this and accepting it would only widen exposure.
+    expect(bearerToken(request("https://x/v1/assets?token=embed.sig"))).toBeNull();
+  });
+
+  it("ignores an empty bearer header", () => {
+    expect(bearerToken(request("https://x/v1/me", { authorization: "Bearer   " }))).toBeNull();
   });
 
   it("returns null when no credential is presented", () => {

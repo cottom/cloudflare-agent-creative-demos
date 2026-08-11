@@ -139,7 +139,10 @@ function mount(container, { token, origin = "", readonly = false, theme = "light
 
   const frameOrigin = origin || window.location.origin;
   const iframe = document.createElement("iframe");
-  const params = new URLSearchParams({ token, theme });
+  // No credential in the frame URL. The editor announces itself once loaded and
+  // is handed the token over postMessage, so it never reaches an access log, a
+  // Referer header or browser history.
+  const params = new URLSearchParams({ theme });
   if (readonly) params.set("readonly", "true");
   iframe.src = `${frameOrigin}/embed?${params}`;
   iframe.style.cssText = "width:100%;height:100%;border:0;display:block;";
@@ -162,6 +165,12 @@ function mount(container, { token, origin = "", readonly = false, theme = "light
     if (new URL(frameOrigin).origin !== event.origin) return;
     const data = event.data;
     if (!data || data.source !== NAMESPACE) return;
+    if (data.type === "auth_required") {
+      // Targeted at the frame's own origin, never "*", so no other document can
+      // receive the token even if one is listening.
+      iframe.contentWindow?.postMessage({ type: "auth", token }, frameOrigin);
+      return;
+    }
     if (data.type === "ready" && !ready.resolved) {
       ready.resolved = true;
       ready.resolve(data);

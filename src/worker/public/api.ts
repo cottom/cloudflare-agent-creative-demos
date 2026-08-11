@@ -358,9 +358,12 @@ async function handleAssets(context: Ctx, parts: string[], method: string): Prom
       {
         object: "embed_session",
         token,
-        // Handed over ready to drop into an iframe, so the integrator does not
-        // have to know how to assemble it.
-        url: `${origin}/embed?token=${encodeURIComponent(token)}`,
+        // A ready-made iframe src for hosts not using the SDK. The token rides
+        // in the *fragment*, which browsers never send to a server, and the
+        // editor strips it from history on read. Hosts using the SDK get a
+        // stronger path still: it loads the frame with no credential at all and
+        // hands the token over via postMessage.
+        url: `${origin}/embed#token=${encodeURIComponent(token)}`,
         asset_id: assetId,
         scopes: granted,
         expires_at: new Date(Date.now() + ttl * 1000).toISOString(),

@@ -51,17 +51,6 @@ export function timingSafeEqualHex(a: string, b: string): boolean {
 }
 
 /**
- * Keys name their own tenant: `cak_<tenant>_<secret>`.
- *
- * Verification has to ask a specific tenant object whether it issued a key, so
- * the tenant has to be known *before* the key is checked. Embedding it removes
- * the alternative — a separate `X-Tenant-Id` header that callers can get wrong
- * and that a global key-to-tenant index would otherwise have to resolve.
- *
- * The tenant segment is public information, not a secret; entropy lives
- * entirely in the 24 random bytes that follow.
- */
-/**
  * Constant-time comparison for arbitrary secrets.
  *
  * `timingSafeEqualHex` assumes a fixed-width digest; this one is for
@@ -77,6 +66,17 @@ export function timingSafeEqualUtf8(a: string, b: string): boolean {
   return diff === 0;
 }
 
+/**
+ * Keys name their own tenant: `cak_<tenant>_<secret>`.
+ *
+ * Verification has to ask a specific tenant object whether it issued a key, so
+ * the tenant has to be known *before* the key is checked. Embedding it removes
+ * the alternative — a separate `X-Tenant-Id` header that callers can get wrong
+ * and that a global key-to-tenant index would otherwise have to resolve.
+ *
+ * The tenant segment is public information, not a secret; entropy lives
+ * entirely in the 24 random bytes that follow.
+ */
 export function generateApiKey(tenantId: string): string {
   const bytes = crypto.getRandomValues(new Uint8Array(24));
   const secret = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -164,25 +164,20 @@ export async function verifyEmbedToken(secret: string, token: string, now = Date
   }
 }
 
-export type PresentedToken = { value: string; source: "header" | "query" };
-
 /**
- * Extract the presented credential and remember where it came from.
+ * Extract the presented credential.
  *
- * Query strings end up in access logs, `Referer` headers and browser history,
- * so a credential in one should be assumed recorded. That is tolerable for an
- * embed token — short-lived and pinned to a single project — and not tolerable
- * for an API key, so the caller rejects keys presented this way. Embedded
- * editors cannot set headers on a WebSocket upgrade or an `<iframe>`
- * navigation, which is the only reason the query path exists at all.
+ * Header only. A credential in a query string should be assumed recorded — it
+ * lands in access logs, `Referer` headers and browser history — and nothing
+ * here needs one: the embedded editor authenticates its API calls with this
+ * header like any other client, and receives its token out of band rather than
+ * through a URL.
  */
-export function bearerToken(request: Request): PresentedToken | null {
+export function bearerToken(request: Request): string | null {
   const header = request.headers.get("authorization");
-  if (header?.toLowerCase().startsWith("bearer ")) {
-    return { value: header.slice(7).trim(), source: "header" };
-  }
-  const query = new URL(request.url).searchParams.get("token");
-  return query ? { value: query, source: "query" } : null;
+  if (!header?.toLowerCase().startsWith("bearer ")) return null;
+  const value = header.slice(7).trim();
+  return value || null;
 }
 
 export function hasScope(principal: Principal, scope: Scope): boolean {

@@ -9,9 +9,10 @@ import "@lofcz/pptist/embed.css";
 /**
  * The embeddable editor.
  *
- * Loaded in an iframe by a host application, authenticated by an embed session
- * token in the query string. It talks to the public API only — the same routes
- * a third party could call themselves — so nothing here has privileges the
+ * Loaded in an iframe by a host application and authenticated by an embed
+ * session token the host hands over after load — never through the URL. It
+ * talks to the public API only, with the same routes and the same `Authorization`
+ * header a third party would use, so nothing here has privileges the
  * integrator's own key does not.
  *
  * The host communicates over `postMessage` rather than by reaching into the
@@ -20,6 +21,7 @@ import "@lofcz/pptist/embed.css";
  */
 
 type HostCommand =
+  | { type: "auth"; token: string }
   | { type: "save" }
   | { type: "getContent" }
   | { type: "setContent"; content: unknown }
@@ -27,6 +29,7 @@ type HostCommand =
   | { type: "startRun"; flow: string; input?: Record<string, unknown> };
 
 type EmbedEvent =
+  | { type: "auth_required" }
   | { type: "ready"; assetId: string; version: number }
   | { type: "change"; dirty: boolean }
   | { type: "saved"; version: number }
@@ -88,14 +91,57 @@ function decodeAssetId(token: string): string | null {
   }
 }
 
+/**
+ * Obtain the embed token without ever putting it in a request URL.
+ *
+ * Preferred path: the host asks for it. The frame loads with no credential,
+ * announces itself, and the host replies with the token over `postMessage`.
+ * Nothing reaches an access log, a `Referer` header, or browser history.
+ *
+ * Fallback for hosts not using the SDK: a URL *fragment*. Fragments are never
+ * sent to the server, and it is stripped from history immediately on read, so
+ * the exposure is one entry in the embedding page's own memory rather than a
+ * line in every log between here and the origin.
+ */
+function acquireToken(timeoutMs = 15_000): Promise<string | null> {
+  const fragment = new URLSearchParams(window.location.hash.slice(1)).get("token");
+  if (fragment) {
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    return Promise.resolve(fragment);
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      window.removeEventListener("message", onMessage);
+      resolve(null);
+    }, timeoutMs);
+
+    function onMessage(event: MessageEvent) {
+      // Only the embedding window may supply a credential. Its origin is
+      // unknown to us by design — a host may embed from anywhere — but a token
+      // from an unrelated frame is worthless anyway: it would be that sender's
+      // own token, granting no access it did not already have.
+      if (event.source !== window.parent) return;
+      const data = event.data as { type?: string; token?: string } | null;
+      if (!data || data.type !== "auth" || typeof data.token !== "string" || !data.token) return;
+      clearTimeout(timer);
+      window.removeEventListener("message", onMessage);
+      resolve(data.token);
+    }
+
+    window.addEventListener("message", onMessage);
+    emit({ type: "auth_required" });
+  });
+}
+
 export async function mountEmbed(root: HTMLElement): Promise<void> {
   const params = new URLSearchParams(window.location.search);
-  const token = params.get("token");
   root.replaceChildren();
   root.style.cssText = "position:fixed;inset:0;display:flex;flex-direction:column;";
 
+  const token = await acquireToken();
   if (!token) {
-    root.textContent = "Missing embed token.";
+    root.textContent = "This editor was not given a token.";
     emit({ type: "error", code: "missing_token", message: "No embed token was supplied." });
     return;
   }
@@ -113,6 +159,15 @@ export async function mountEmbed(root: HTMLElement): Promise<void> {
   let mounted: PptistMountResult | null = null;
   // The echo of our own save must not be mistaken for a host edit.
   let lastDeck = "";
+  /**
+   * "Dirty" means a person changed something, so it is gated on a person having
+   * touched the editor. The editor keeps settling after mount resolves — layout
+   * measurement and auto-fit rewrite the document asynchronously — and those
+   * writes are indistinguishable from edits by content comparison alone.
+   * Re-baselining after mount narrowed the window but did not close it; an
+   * interaction gate closes it, and states the actual rule.
+   */
+  let userInteracted = false;
 
   try {
     const content = await api.json<{ version: number; content: { deck?: EmbedDocument } }>(
@@ -125,6 +180,9 @@ export async function mountEmbed(root: HTMLElement): Promise<void> {
     const stage = document.createElement("div");
     stage.style.cssText = "flex:1;min-height:0;";
     root.appendChild(stage);
+    for (const kind of ["pointerdown", "keydown"] as const) {
+      stage.addEventListener(kind, () => { userInteracted = true; }, { capture: true, once: false });
+    }
 
     mounted = await mountPptist(stage, {
       locale: "en",
@@ -138,6 +196,9 @@ export async function mountEmbed(root: HTMLElement): Promise<void> {
         const serialized = JSON.stringify(next);
         if (serialized === lastDeck) return;
         lastDeck = serialized;
+        // Settling writes still move the baseline forward, so a later real
+        // edit is still detected — they just do not raise the flag.
+        if (!userInteracted) return;
         dirty = true;
         emit({ type: "change", dirty: true });
       }

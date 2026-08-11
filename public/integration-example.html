@@ -77,9 +77,16 @@ function write(label, payload) {
   log.prepend(row);
 }
 
-const token = new URLSearchParams(location.search).get("token");
+/**
+ * Read from the fragment, not the query string: fragments are never sent to a
+ * server, so the token stays out of access logs. Stripped from history right
+ * after reading. A real host holds the token in memory from its own backend
+ * call and never puts it in a URL at all.
+ */
+const token = new URLSearchParams(location.hash.slice(1)).get("token");
+if (token) history.replaceState(null, "", location.pathname);
 if (!token) {
-  write("error", "Open this page with ?token=<embed session token>");
+  write("error", "Open this page with #token=<embed session token>");
 } else {
   const editor = CreativeAgent.mount(document.getElementById("editor"), { token });
   const api = CreativeAgent.client({ token });
