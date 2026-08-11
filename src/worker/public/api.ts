@@ -27,6 +27,14 @@ import {
   type AssetRecord
 } from "./dto";
 import type { JsonObject, ProjectKind, ProjectState } from "../../shared/types";
+import type { WorkflowBindingName } from "../studio-agent";
+
+/** Public flow id → the Workflow binding that runs it. */
+function workflowBindingForFlow(flow: string): WorkflowBindingName | null {
+  if (flow === "presentation.generate") return "PPT_BUILD_WORKFLOW";
+  if (flow === "canvas.variants") return "CANVAS_VARIANTS_WORKFLOW";
+  return null;
+}
 
 /**
  * The public API.
@@ -590,6 +598,19 @@ async function handleRuns(
     return ok(toRun({ ...run, id: runId }, assetId, pending), requestId);
   }
 
+  if (parts[4] === "cancel" && method === "POST") {
+    requireScope(principal, "workflows:run");
+    const body = await readJson<{ reason?: string }>(context.request).catch(() => ({}) as { reason?: string });
+    const binding = workflowBindingForFlow(resolved.flow);
+    if (!binding) throw problem.invalid(`Runs of flow "${resolved.flow}" cannot be cancelled.`);
+    const agent = await agentFor(env, principal, kind, assetId, run.sessionId);
+    const result = await agent.cancelWorkflow(resolved.instanceId, binding, body.reason?.trim() || "Cancelled by request");
+    return ok(
+      { id: runId, object: "run", status: result.alreadySettled ? result.status : "cancelled", asset_id: assetId },
+      requestId
+    );
+  }
+
   // POST /v1/assets/{id}/runs/{runId}/actions/{actionId}
   if (parts[4] === "actions" && parts[5] && method === "POST") {
     requireScope(principal, "agent:chat");
@@ -598,10 +619,23 @@ async function handleRuns(
     if (!interaction) throw problem.notFound(`Action ${actionId}`);
     const agent = await agentFor(env, principal, kind, assetId, interaction.sessionId);
     const body = await readJson<{ response?: JsonObject; decline?: boolean; reason?: string }>(context.request);
-    const result = body.decline
-      ? await agent.rejectInteraction(actionId, body.reason ?? "Declined")
-      : await agent.resolveInteraction(actionId, body.response ?? {});
-    return ok(toAction(result as never, assetId), requestId);
+    try {
+      const result = body.decline
+        ? await agent.rejectInteraction(actionId, body.reason ?? "Declined")
+        : await agent.resolveInteraction(actionId, body.response ?? {});
+      return ok(toAction(result as never, assetId), requestId);
+    } catch (error) {
+      // RPC flattens custom errors to their message, so the wire carries the
+      // classification rather than the class.
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("has expired")) {
+        throw problem.conflict("This action expired before it was answered and is no longer accepted.");
+      }
+      if (message.includes("does not match this interaction")) {
+        throw problem.validation([{ field: "response", message: "Does not match the action's declared schema" }]);
+      }
+      throw error;
+    }
   }
 
   throw problem.notFound("This route");

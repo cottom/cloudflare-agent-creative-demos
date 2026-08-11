@@ -3,6 +3,27 @@ import { tool, type ToolSet, type UIMessage } from "ai";
 import { z } from "zod";
 import { PPT_THEMES } from "../shared/themes";
 import { uiSpecSchema } from "../shared/ui-schema";
+import {
+  contractFor,
+  describeSubmissionForModel,
+  validateSubmission,
+  type ContractViolation
+} from "../shared/interaction-contract";
+import { isExpired } from "../shared/interaction-expiry";
+
+/** A submission the interaction's own declaration does not permit. */
+export class InteractionContractError extends Error {
+  constructor(public violations: ContractViolation[]) {
+    super("Submission does not match this interaction's contract");
+  }
+}
+
+/** A submission arriving after the interaction stopped waiting for one. */
+export class InteractionExpiredError extends Error {
+  constructor(interactionId: string) {
+    super(`Interaction ${interactionId} has expired`);
+  }
+}
 import { studioAgentName } from "../shared/policy";
 import type {
   CanvasCommand,
@@ -103,6 +124,8 @@ function mapWorkflowStatus(status: string | undefined): WorkflowRun["status"] {
   if (status === "queued") return "queued";
   return "running";
 }
+
+export type WorkflowBindingName = "PPT_BUILD_WORKFLOW" | "CANVAS_VARIANTS_WORKFLOW";
 
 export class StudioAgent extends Think<Env> {
   override sendReasoning = false;
@@ -273,7 +296,15 @@ export class StudioAgent extends Think<Env> {
     const stub = getProjectStub(this.env, config.kind, config.projectId);
     const interaction = await stub.getInteraction(interactionId);
     if (!interaction) throw new Error(`Interaction not found: ${interactionId}`);
+    // Already answered. Returning the settled record rather than applying a
+    // second submission is what makes an at-least-once retry safe.
     if (interaction.status !== "pending") return interaction;
+    if (isExpired(interaction)) throw new InteractionExpiredError(interactionId);
+
+    // Authoritative validation. The browser validates too, but that only helps
+    // the honest caller; this is the check that decides.
+    const violations = validateSubmission(contractFor(interaction), response);
+    if (violations.length) throw new InteractionContractError(violations);
 
     if (interaction.workflowId) {
       await this.approveWorkflow(interaction.workflowId, {
@@ -287,7 +318,7 @@ export class StudioAgent extends Think<Env> {
         role: "user",
         parts: [{
           type: "text",
-          text: `Structured UI response for interaction ${interactionId}: ${JSON.stringify(response)}. Continue the requested project work using this response.`
+          text: describeSubmissionForModel(interactionId, response)
         }]
       }], {
         submissionId: messageId,
@@ -307,6 +338,29 @@ export class StudioAgent extends Think<Env> {
     if (interaction.status !== "pending") return interaction;
     if (interaction.workflowId) await this.rejectWorkflow(interaction.workflowId, { reason });
     return stub.resolveInteraction(interactionId, { reason }, "cancelled");
+  }
+
+  /**
+   * Stop a run that is still going.
+   *
+   * Rejecting a pending approval already ends a run that is waiting on a
+   * person, but a run doing work had no stop at all — the only way out was to
+   * let it finish and pay for whatever it did on the way. Terminating the
+   * instance is what actually halts execution; recording the status only makes
+   * it visible, so it is done second and the terminate failure is not swallowed.
+   */
+  async cancelWorkflow(instanceId: string, binding: WorkflowBindingName, reason: string) {
+    const workflow = this.env[binding];
+    const instance = await workflow.get(instanceId);
+    const status = await instance.status();
+    // Terminating something already finished is not an error worth raising —
+    // the caller wanted it stopped, and it is stopped.
+    if (["complete", "errored", "terminated"].includes(String(status.status))) {
+      return { instanceId, alreadySettled: true, status: String(status.status) };
+    }
+    await instance.terminate();
+    await this.recordWorkflow(instanceId, workflowType(binding), "cancelled", 1, reason);
+    return { instanceId, alreadySettled: false, status: "cancelled" };
   }
 
   async exportCurrentPpt() {

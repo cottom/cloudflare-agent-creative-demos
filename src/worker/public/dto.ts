@@ -1,3 +1,4 @@
+import { expiresAt as deadlineFor, secondsRemaining } from "../../shared/interaction-expiry";
 import type {
   ActivityEvent,
   ExportArtifact,
@@ -169,6 +170,10 @@ export function toAction(interaction: ProjectInteraction, assetId: string): Publ
     status: interaction.status === "cancelled" ? "declined" : interaction.status,
     asset_id: assetId,
     response: interaction.response ?? null,
+    // A caller that has to answer needs to know how long they have; without it
+    // an expiry is only discoverable by being rejected.
+    expires_at: deadlineFor(interaction),
+    expires_in: secondsRemaining(interaction),
     created_at: interaction.createdAt,
     resolved_at: interaction.resolvedAt ?? null
   };
