@@ -303,3 +303,76 @@ textarea { resize:vertical; line-height:1.45; }
 .inline-radios .chip input { display:none; }
 .slide-canvas { max-width:100%; }
 .slide-canvas-column { overflow-x:hidden; }
+
+/* ---- Layout gallery ---- */
+.layout-gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px; padding:10px; border:1px solid var(--line); border-radius:11px; background:var(--surface); margin-bottom:10px; max-height:230px; overflow:auto; }
+.layout-gallery button { display:flex; flex-direction:column; gap:3px; text-align:left; border:1px solid var(--line); border-radius:9px; padding:8px; background:var(--surface); cursor:pointer; }
+.layout-gallery button:hover:not(:disabled) { border-color:var(--accent); box-shadow:0 3px 10px rgba(91,108,255,.13); }
+.layout-gallery strong { font-size:10px; color:var(--ink); }
+.layout-gallery small { font-size:8px; color:var(--muted); line-height:1.35; }
+.layout-glyph { display:block; height:26px; border-radius:5px; background:linear-gradient(180deg,#eef1ff,#e3e8ff); border:1px solid #d5dcff; }
+
+/* ---- AI image bar ---- */
+.ai-image-bar { display:flex; gap:8px; margin-bottom:10px; }
+.ai-image-bar input { flex:1; border:1px solid var(--line); border-radius:9px; padding:8px 10px; font-size:11px; font-family:inherit; background:var(--surface); color:var(--ink); }
+.ai-image-bar .button { white-space:nowrap; }
+
+.animation-block { display:flex; flex-direction:column; gap:5px; }
+
+/* ---- Element animations (presenter only) ---- */
+.slide-element.presenting { animation-fill-mode:both; animation-timing-function:cubic-bezier(.22,.61,.36,1); }
+.slide-element.anim-fade { animation-name:el-fade; }
+.slide-element.anim-slide-up { animation-name:el-slide-up; }
+.slide-element.anim-slide-down { animation-name:el-slide-down; }
+.slide-element.anim-slide-left { animation-name:el-slide-left; }
+.slide-element.anim-slide-right { animation-name:el-slide-right; }
+.slide-element.anim-zoom { animation-name:el-zoom; }
+.slide-element.anim-flip { animation-name:el-flip; }
+.slide-element.anim-bounce { animation-name:el-bounce; }
+.slide-element.anim-pulse { animation-name:el-pulse; }
+@keyframes el-fade { from { opacity:0; } to { opacity:1; } }
+@keyframes el-slide-up { from { opacity:0; transform:translateY(26px); } to { opacity:1; transform:translateY(0); } }
+@keyframes el-slide-down { from { opacity:0; transform:translateY(-26px); } to { opacity:1; transform:translateY(0); } }
+@keyframes el-slide-left { from { opacity:0; transform:translateX(34px); } to { opacity:1; transform:translateX(0); } }
+@keyframes el-slide-right { from { opacity:0; transform:translateX(-34px); } to { opacity:1; transform:translateX(0); } }
+@keyframes el-zoom { from { opacity:0; transform:scale(.82); } to { opacity:1; transform:scale(1); } }
+@keyframes el-flip { from { opacity:0; transform:perspective(700px) rotateY(72deg); } to { opacity:1; transform:perspective(700px) rotateY(0); } }
+@keyframes el-bounce { 0% { opacity:0; transform:translateY(-30px);} 60% { opacity:1; transform:translateY(8px);} 100% { transform:translateY(0);} }
+@keyframes el-pulse { 0%,100% { transform:scale(1);} 50% { transform:scale(1.06);} }
+@media (prefers-reduced-motion: reduce) {
+  .slide-element.presenting { animation:none !important; }
+}
+
+/* ---- Presenter view ---- */
+.slideshow { position:fixed; inset:0; z-index:80; background:#05070f; color:#fff; display:grid; grid-template-rows:auto 1fr auto; }
+.slideshow-bar { display:flex; align-items:center; justify-content:space-between; padding:9px 14px; border-bottom:1px solid rgba(255,255,255,.1); font-size:11px; }
+.slideshow-controls { display:flex; align-items:center; gap:8px; }
+.slideshow-controls button { border:1px solid rgba(255,255,255,.22); background:transparent; color:#fff; border-radius:7px; padding:4px 9px; font-size:10px; cursor:pointer; font-family:inherit; }
+.slideshow-controls button:disabled { opacity:.35; cursor:not-allowed; }
+.slideshow-controls .toggle.active { border-color:var(--accent-2); color:var(--accent-2); }
+.slideshow-controls b { font-size:11px; min-width:56px; text-align:center; }
+.slideshow-body { display:grid; grid-template-columns:1fr; min-height:0; }
+.slideshow-body.with-notes { grid-template-columns:minmax(0,1fr) 260px; }
+.slideshow-stage { display:flex; align-items:center; justify-content:center; padding:16px; min-width:0; min-height:0; }
+.slideshow-stage .slide-canvas { box-shadow:0 20px 60px rgba(0,0,0,.55); }
+.slideshow-notes { border-left:1px solid rgba(255,255,255,.1); padding:14px; overflow:auto; }
+.slideshow-notes .eyebrow { color:rgba(255,255,255,.5); }
+.slideshow-notes p { font-size:12px; line-height:1.55; color:rgba(255,255,255,.88); margin:6px 0 16px; white-space:pre-wrap; }
+.slideshow-rail { display:flex; gap:5px; padding:8px 14px; border-top:1px solid rgba(255,255,255,.1); overflow-x:auto; }
+.slideshow-thumb { min-width:28px; height:24px; border-radius:6px; border:1px solid rgba(255,255,255,.2); background:transparent; color:rgba(255,255,255,.7); font-size:10px; cursor:pointer; }
+.slideshow-thumb.active { border-color:var(--accent-2); color:var(--accent-2); font-weight:800; }
+.transition-fade { animation:stage-fade .34s ease both; }
+.transition-slide { animation:stage-slide .34s ease both; }
+.transition-zoom { animation:stage-zoom .34s ease both; }
+.transition-flip { animation:stage-flip .42s ease both; }
+@keyframes stage-fade { from { opacity:0; } to { opacity:1; } }
+@keyframes stage-slide { from { opacity:0; transform:translateX(48px);} to { opacity:1; transform:translateX(0);} }
+@keyframes stage-zoom { from { opacity:0; transform:scale(.93);} to { opacity:1; transform:scale(1);} }
+@keyframes stage-flip { from { opacity:0; transform:perspective(1100px) rotateY(28deg);} to { opacity:1; transform:perspective(1100px) rotateY(0);} }
+
+/* ---- PPTist embed ---- */
+.pptist-shell { position:relative; height:calc(100vh - 220px); min-height:520px; border:1px solid var(--line); border-radius:14px; overflow:hidden; background:var(--surface); }
+.pptist-host { width:100%; height:100%; }
+.pptist-loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:12px; color:var(--muted); background:var(--surface); z-index:2; }
+/* PPTist ships its own layout; give it the full shell rather than our grid. */
+.ppt-studio .pptist-shell + .workspace-panel { margin-top:12px; }

@@ -6,7 +6,7 @@ describe("demo project seeds", () => {
     const project = createInitialPptState("ppt-seed");
     expect(project.id).toBe("ppt-seed");
     expect(project.kind).toBe("ppt");
-    expect(project.document.slides.length).toBeGreaterThanOrEqual(3);
+    expect(project.document.deck.slides.length).toBeGreaterThanOrEqual(3);
     expect(project.sessions[0]?.projectId).toBe(project.id);
     expect(project.artifacts).toEqual([]);
   });

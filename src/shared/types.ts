@@ -1,3 +1,7 @@
+import type { PptistDocument } from "./pptist";
+
+export type { PptistDocument };
+
 export type ProjectKind = "ppt" | "canvas";
 
 /**
@@ -134,102 +138,15 @@ export type PptTheme = {
 };
 
 /**
- * Slide geometry is stored in inches, matching PptxGenJS's `LAYOUT_WIDE`.
- *
- * The editor scales inches to pixels for display; keeping the model in the
- * export's native unit means what you drag is exactly what PowerPoint renders,
- * with no rounding drift between the two.
+ * The presentation asset. `deck` is the canonical PPTist document — the same
+ * JSON the embedded editor loads and emits, so there is no translation layer.
+ * The surrounding fields are project metadata the agent and workflows use.
  */
-export const SLIDE_WIDTH_IN = 13.333;
-export const SLIDE_HEIGHT_IN = 7.5;
-
-export type ElementAlign = "left" | "center" | "right";
-export type ElementVAlign = "top" | "middle" | "bottom";
-
-export type SlideElementBase = {
-  id: string;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  /** Degrees, clockwise, about the element centre. */
-  rotation: number;
-  /** Paint order; higher is nearer the viewer. */
-  z: number;
-  locked?: boolean;
-};
-
-export type TextElement = SlideElementBase & {
-  type: "text";
-  text: string;
-  role: "title" | "body" | "caption" | "metric";
-  fontSize: number;
-  bold?: boolean;
-  italic?: boolean;
-  underline?: boolean;
-  /** Hex without `#`, matching the theme tokens and PptxGenJS. */
-  color?: string;
-  fill?: string;
-  align?: ElementAlign;
-  valign?: ElementVAlign;
-  bullet?: boolean;
-  lineSpacing?: number;
-};
-
-export type ShapeElement = SlideElementBase & {
-  type: "shape";
-  shape: "rect" | "roundRect" | "ellipse" | "triangle" | "line";
-  fill?: string;
-  stroke?: string;
-  strokeWidth?: number;
-  /** 0–1, only meaningful for `roundRect`. */
-  radius?: number;
-};
-
-export type ImageElement = SlideElementBase & {
-  type: "image";
-  /** R2 artifact key, served through /api/artifacts. */
-  assetKey: string;
-  altText?: string;
-};
-
-export type TableElement = SlideElementBase & {
-  type: "table";
-  rows: string[][];
-  headerRow?: boolean;
-  fontSize?: number;
-};
-
-export type SlideElement = TextElement | ShapeElement | ImageElement | TableElement;
-
-/**
- * A patch may target any element kind, so it is the intersection of every
- * element's optional fields. `id` and `type` are excluded: changing either
- * would make it a different element, which is an add plus a delete.
- */
-export type SlideElementPatch = Partial<
-  Omit<TextElement, "id" | "type"> &
-  Omit<ShapeElement, "id" | "type"> &
-  Omit<ImageElement, "id" | "type"> &
-  Omit<TableElement, "id" | "type">
->;
-
-export type PptSlide = {
-  id: string;
-  title: string;
-  subtitle?: string;
-  body: string[];
-  notes?: string;
-  layout: "title" | "statement" | "bullets" | "two_column" | "metrics";
-  elements: SlideElement[];
-};
-
 export type PresentationDocument = {
   title: string;
   objective: string;
   audience: string;
-  theme: PptTheme;
-  slides: PptSlide[];
+  deck: PptistDocument;
 };
 
 export type CanvasNode = {
@@ -291,18 +208,18 @@ export type CanvasProjectState = ProjectBaseState & {
 
 export type ProjectState = PptProjectState | CanvasProjectState;
 
+/**
+ * Presentation commands.
+ *
+ * Fine-grained element editing now happens inside PPTist and arrives here as a
+ * whole-deck replacement, which is why the bespoke element commands are gone:
+ * the editor is the source of truth for composition, and duplicating its
+ * command surface here would mean two models drifting apart.
+ */
 export type PptCommand =
   | { type: "ppt.replace_document"; document: PresentationDocument }
-  | { type: "ppt.add_slide"; slide: PptSlide; index?: number }
-  | { type: "ppt.update_slide"; slideId: string; patch: Partial<Omit<PptSlide, "id">> }
-  | { type: "ppt.delete_slide"; slideId: string }
-  | { type: "ppt.reorder_slides"; slideIds: string[] }
-  | { type: "ppt.set_theme"; theme: PptTheme }
-  | { type: "ppt.add_element"; slideId: string; element: SlideElement }
-  | { type: "ppt.update_element"; slideId: string; elementId: string; patch: SlideElementPatch }
-  | { type: "ppt.delete_element"; slideId: string; elementId: string }
-  /** Absolute paint order; the editor computes the target `z` for send-to-back etc. */
-  | { type: "ppt.set_element_order"; slideId: string; elementId: string; z: number };
+  | { type: "ppt.set_deck"; deck: PptistDocument }
+  | { type: "ppt.set_meta"; patch: Partial<Pick<PresentationDocument, "title" | "objective" | "audience">> };
 
 export type CanvasCommand =
   | { type: "canvas.replace_document"; document: CanvasDocument }

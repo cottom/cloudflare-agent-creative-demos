@@ -1,7 +1,13 @@
 import { generateObject } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
-import { PPT_THEMES } from "../../shared/themes";
+import {
+  createPptistTheme,
+  pptistElementId,
+  pptistSlideId,
+  PPTIST_VIEWPORT_SIZE,
+  type PptistSlide
+} from "../../shared/pptist";
 import type {
   CanvasVariantsWorkflowParams,
   PptBuildWorkflowParams,
@@ -30,19 +36,72 @@ const pptPlanSchema = z.object({
 
 export type PptPlan = z.infer<typeof pptPlanSchema>;
 
-const presentationSchema = z.object({
+/**
+ * The deck plan the model produces.
+ *
+ * It picks a PPTist layout recipe per slide and fills its content slots — it
+ * never authors HTML or coordinates. PPTist's engine themes, positions and
+ * auto-fits everything, which is what makes the output look designed instead
+ * of like the same bullet list thirteen times.
+ *
+ * Slots are a flat optional union of every layout's slot names: a per-layout
+ * discriminated union produces far more malformed output from smaller models
+ * than a permissive object does, and the engine validates slots anyway.
+ */
+const slotSchema = z.object({
+  title: z.string().max(160).optional(),
+  subtitle: z.string().max(240).optional(),
+  eyebrow: z.string().max(60).optional(),
+  body: z.string().max(600).optional(),
+  caption: z.string().max(200).optional(),
+  bullets: z.array(z.string().max(200)).max(6).optional(),
+  ordered: z.string().max(10).optional(),
+  leftHeading: z.string().max(120).optional(),
+  leftBullets: z.array(z.string().max(200)).max(5).optional(),
+  leftBody: z.string().max(400).optional(),
+  rightHeading: z.string().max(120).optional(),
+  rightBullets: z.array(z.string().max(200)).max(5).optional(),
+  rightBody: z.string().max(400).optional(),
+  quote: z.string().max(320).optional(),
+  attribution: z.string().max(120).optional(),
+  stat: z.string().max(40).optional(),
+  statLabel: z.string().max(120).optional(),
+  stats: z.array(z.object({ stat: z.string().max(40), statLabel: z.string().max(120) })).max(4).optional(),
+  cards: z.array(z.object({ title: z.string().max(80), body: z.string().max(220).optional() })).max(6).optional(),
+  steps: z.array(z.object({ title: z.string().max(80), body: z.string().max(220).optional() })).max(6).optional(),
+  headers: z.array(z.string().max(60)).max(5).optional(),
+  rows: z.array(z.array(z.string().max(120)).max(5)).max(6).optional(),
+  chartType: z.enum(["bar", "line", "pie"]).optional(),
+  labels: z.array(z.string().max(40)).max(12).optional(),
+  series: z.array(z.object({ name: z.string().max(40), data: z.array(z.number()).max(12) })).max(4).optional(),
+  imageSide: z.enum(["left", "right"]).optional()
+});
+
+export const LAYOUT_IDS = [
+  "title", "section", "closing", "bullets", "twoColumn", "imageText",
+  "bigStat", "quote", "chart", "comparison", "cards", "numbered", "imageFull"
+] as const;
+
+const deckPlanSchema = z.object({
   title: z.string().min(3).max(120),
   objective: z.string().min(8).max(500),
   audience: z.string().min(2).max(160),
-  themeId: z.enum(["midnight", "editorial", "minimal", "sunrise"]),
+  styleId: z.enum(["academic", "minimal", "bold", "playful"]),
   slides: z.array(z.object({
-    title: z.string().min(2).max(120),
-    subtitle: z.string().max(180).optional(),
-    body: z.array(z.string().min(2).max(240)).min(1).max(8),
-    notes: z.string().max(1200).optional(),
-    layout: z.enum(["title", "statement", "bullets", "two_column", "metrics"])
-  })).min(3).max(30)
+    layoutId: z.enum(LAYOUT_IDS),
+    variantId: z.string().max(40).optional(),
+    slots: slotSchema,
+    notes: z.string().max(800).optional(),
+    /**
+     * Set only when a picture genuinely earns its place. The model decides —
+     * every slide having art is as monotonous as none of them having it.
+     */
+    imagePrompt: z.string().min(20).max(900).optional()
+  })).min(3).max(20)
 });
+
+export type DeckPlan = z.infer<typeof deckPlanSchema>;
+export type DeckPlanSlide = DeckPlan["slides"][number];
 
 const canvasDirectionsSchema = z.object({
   campaignName: z.string().min(2).max(100),
@@ -73,46 +132,120 @@ export async function generatePptPlan(env: Env, params: PptBuildWorkflowParams):
   return object;
 }
 
-export async function generatePresentationDocument(
+export async function generateDeckPlan(
   env: Env,
   params: PptBuildWorkflowParams,
   plan: PptPlan,
   humanResponse?: Record<string, unknown>
-): Promise<PresentationDocument> {
-  const requestedTheme = typeof humanResponse?.themeId === "string" ? humanResponse.themeId : plan.recommendedTheme;
+): Promise<DeckPlan> {
   const additionalDirection = typeof humanResponse?.direction === "string" ? humanResponse.direction : "";
   const approvedOutline = Array.isArray(humanResponse?.slides) ? humanResponse.slides : plan.slides;
   const { object } = await generateObject({
     model: workersLanguageModel(env),
-    schema: presentationSchema,
-    temperature: 0.3,
+    schema: deckPlanSchema,
+    temperature: 0.4,
     prompt: [
-      "You are a senior presentation writer. Produce the final editable presentation document.",
+      "You are a presentation designer composing slides in PPTist.",
+      "For each slide choose the layout recipe whose composition matches its job, then fill that layout's content slots.",
+      "",
+      "Layouts and their slots:",
+      "- title / section / closing: title, subtitle, eyebrow",
+      "- bullets: title, bullets[] (variants: standard, leftRail, rightRail)",
+      "- twoColumn: title, leftHeading, leftBullets[], rightHeading, rightBullets[] (variants: even, leftWide, rightWide)",
+      "- imageText: title, bullets[] or body, caption (variants: imageRight, imageLeft) — needs an imagePrompt",
+      "- bigStat: stats[] of {stat,statLabel}, or stat + statLabel, title, body (variants: centered, edgeAligned)",
+      "- quote: quote, attribution (variants: centered, leftHeavy)",
+      "- chart: title, chartType, labels[], series[] of {name,data[]}",
+      "- comparison: title, headers[], rows[][]",
+      "- cards: title, cards[] of {title,body} (variants: grid, accentPanel, leftOffset, rightOffset)",
+      "- numbered: title, steps[] of {title,body} (variants: standard, rightRail)",
+      "- imageFull: title, subtitle — needs an imagePrompt; use it for the single most striking slide",
+      "",
+      "Rules:",
+      "- Vary the layout family across the deck. A deck where every slide is 'bullets' is the failure mode to avoid.",
+      "- Open with 'title' and end with 'closing'.",
+      "- Match the layout to the content: parallel items -> cards, ordered steps -> numbered, a headline number -> bigStat, data -> chart, a memorable line -> quote.",
+      "- Write slot text as plain text or Markdown (**bold**, _italic_). NEVER write HTML tags.",
+      "- Add imagePrompt ONLY where a picture genuinely adds meaning (typically 1-3 slides). Prompts must be self-contained, describe composition, subject, lighting and mood, and must not ask for legible text in the image.",
+      "- Do not invent statistics that are not in the source material.",
+      "",
       `Objective: ${params.objective}`,
       `Audience: ${params.audience ?? plan.audience}`,
-      `Theme ID requested: ${requestedTheme}`,
-      `Approved plan: ${JSON.stringify({ ...plan, slides: approvedOutline })}`,
+      `Approved outline: ${JSON.stringify({ ...plan, slides: approvedOutline })}`,
       params.sourceNotes ? `Source notes:\n${params.sourceNotes}` : "",
-      additionalDirection ? `Human direction:\n${additionalDirection}` : "",
-      "Requirements: concise slide titles, evidence-oriented bullet points, logical narrative, no fabricated statistics, and useful speaker notes when context is needed."
-    ].filter(Boolean).join("\n\n")
+      additionalDirection ? `Human direction:\n${additionalDirection}` : ""
+    ].filter(Boolean).join("\n")
   });
-  const theme = PPT_THEMES[object.themeId] ?? PPT_THEMES.midnight;
+  return object;
+}
+
+/** Compose one authored slide into PPTist text elements on the 1000x562.5 stage. */
+function composeSlide(slide: {
+  title: string;
+  subtitle?: string;
+  body: string[];
+  notes?: string;
+}): PptistSlide {
+  const elements: PptistSlide["elements"] = [
+    {
+      id: pptistElementId(),
+      type: "text",
+      left: 70,
+      top: 62,
+      width: PPTIST_VIEWPORT_SIZE - 140,
+      height: 80,
+      rotate: 0,
+      content: `<p style="font-size:32px"><strong>${escapeHtml(slide.title)}</strong></p>`,
+      defaultFontName: "Aptos",
+      defaultColor: "#111827"
+    }
+  ];
+
+  if (slide.subtitle) {
+    elements.push({
+      id: pptistElementId(),
+      type: "text",
+      left: 70,
+      top: 148,
+      width: PPTIST_VIEWPORT_SIZE - 140,
+      height: 44,
+      rotate: 0,
+      content: `<p style="font-size:18px">${escapeHtml(slide.subtitle)}</p>`,
+      defaultFontName: "Aptos",
+      defaultColor: "#667085"
+    });
+  }
+
+  if (slide.body.length) {
+    elements.push({
+      id: pptistElementId(),
+      type: "text",
+      left: 70,
+      top: slide.subtitle ? 208 : 172,
+      width: PPTIST_VIEWPORT_SIZE - 140,
+      height: 280,
+      rotate: 0,
+      content: slide.body.map((line) => `<li style="font-size:18px">${escapeHtml(line)}</li>`).join(""),
+      defaultFontName: "Aptos",
+      defaultColor: "#334155"
+    });
+  }
+
   return {
-    title: object.title,
-    objective: object.objective,
-    audience: object.audience,
-    theme,
-    slides: object.slides.map((slide, index) => ({
-      id: `slide-${crypto.randomUUID()}`,
-      title: slide.title,
-      subtitle: slide.subtitle,
-      body: slide.body,
-      notes: slide.notes,
-      layout: slide.layout,
-      elements: []
-    }))
+    id: pptistSlideId(),
+    type: "content",
+    elements,
+    ...(slide.notes ? { remark: slide.notes } : {})
   };
+}
+
+/** Model output becomes HTML, so it must be escaped before interpolation. */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 export async function generateCanvasDirections(

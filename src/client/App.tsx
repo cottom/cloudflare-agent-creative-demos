@@ -51,7 +51,7 @@ export default function App() {
         const canvas = result.projects.canvas as CanvasProjectState;
         setProjects({ ppt, canvas });
         setActiveSessions({ ppt: result.defaults.ppt.sessionId, canvas: result.defaults.canvas.sessionId });
-        setSelected({ ppt: ppt.document.slides[0]?.id, canvas: canvas.document.nodes[0]?.id });
+        setSelected({ ppt: undefined, canvas: canvas.document.nodes[0]?.id });
         setModels(result.models);
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : String(caught));
@@ -166,11 +166,9 @@ export default function App() {
         {activeKind === "ppt" ? (
           <PptStudio
             project={projects.ppt}
-            selectedId={selected.ppt}
             busy={busy}
             workspaceFiles={workspaceFiles.ppt}
             workspaceLoading={workspaceLoading}
-            onSelect={(id) => setSelected((current) => ({ ...current, ppt: id }))}
             onMutate={(commands: PptCommand[], summary) => mutate("ppt", commands, summary)}
             onStartWorkflow={(params) => run(async () => {
               await api.startPptBuild(projects.ppt.id, activeSessions.ppt, params);

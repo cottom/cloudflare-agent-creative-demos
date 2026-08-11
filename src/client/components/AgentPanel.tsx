@@ -6,6 +6,7 @@ import { studioAgentName } from "../../shared/policy";
 import type { EditorAwareness, JsonObject, ProjectState, SessionMeta } from "../../shared/types";
 import { describeUiResponse, parseUiSpec, type UiResponse } from "../../shared/ui-schema";
 import { api } from "../lib/api";
+import { isPptistTool, runPptistTool } from "../lib/pptist-bridge";
 import { GenerativeUi } from "./GenerativeUi";
 import { InteractionCard } from "./InteractionCard";
 
@@ -38,7 +39,16 @@ export function AgentPanel(props: Props) {
     name: studioAgentName(props.project.kind, props.project.id, props.activeSessionId)
   });
 
-  const { messages, sendMessage, addToolOutput, clearHistory, status, isStreaming } = useAgentChat({ agent });
+  const { messages, sendMessage, addToolOutput, clearHistory, status, isStreaming } = useAgentChat({
+    agent,
+    // PPTist tools have no server implementation: they run here, against the
+    // editor mounted in this page, and the result is handed back to the model.
+    onToolCall: async ({ toolCall }) => {
+      if (!isPptistTool(toolCall.toolName)) return;
+      const output = await runPptistTool(toolCall.toolName, toolCall.input);
+      addToolOutput({ toolCallId: toolCall.toolCallId, toolName: toolCall.toolName, output });
+    }
+  });
 
   const streaming = isStreaming || status === "streaming" || status === "submitted";
 

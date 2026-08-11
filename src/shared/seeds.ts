@@ -1,5 +1,11 @@
-import { PPT_THEMES } from "./themes";
-import type { CanvasProjectState, PptProjectState, PptSlide, SessionMeta } from "./types";
+import {
+  createPptistTheme,
+  pptistElementId,
+  pptistSlideId,
+  PPTIST_VIEWPORT_SIZE,
+  type PptistSlide
+} from "./pptist";
+import type { CanvasProjectState, PptProjectState, SessionMeta } from "./types";
 
 const now = () => new Date().toISOString();
 
@@ -19,8 +25,41 @@ export function createInitialSession(
   };
 }
 
-function slide(id: string, title: string, body: string[], layout: PptSlide["layout"]): PptSlide {
-  return { id, title, body, layout, elements: [] };
+/** Stage is 1000 x 562.5 px; these offsets keep the seed inside it. */
+const STAGE_W = PPTIST_VIEWPORT_SIZE;
+
+function textSlide(title: string, body: string[]): PptistSlide {
+  return {
+    id: pptistSlideId(),
+    type: "content",
+    elements: [
+      {
+        id: pptistElementId(),
+        type: "text",
+        left: 70,
+        top: 68,
+        width: STAGE_W - 140,
+        height: 78,
+        rotate: 0,
+        // PPTist stores rich text as HTML.
+        content: `<p style="font-size:32px"><strong>${title}</strong></p>`,
+        defaultFontName: "Aptos",
+        defaultColor: "#111827"
+      },
+      {
+        id: pptistElementId(),
+        type: "text",
+        left: 70,
+        top: 175,
+        width: STAGE_W - 140,
+        height: 250,
+        rotate: 0,
+        content: body.map((line) => `<li>${line}</li>`).join(""),
+        defaultFontName: "Aptos",
+        defaultColor: "#334155"
+      }
+    ]
+  };
 }
 
 export function createInitialPptState(id = "ppt-demo"): PptProjectState {
@@ -48,25 +87,28 @@ export function createInitialPptState(id = "ppt-demo"): PptProjectState {
       title: "AI Product Strategy",
       objective: "Explain the opportunity and align the team on execution",
       audience: "Product and executive team",
-      theme: PPT_THEMES.midnight,
-      slides: [
-        slide("slide-1", "AI-native creation is becoming a workspace", [
-          "Projects persist longer than conversations",
-          "Agents, workflows, and humans edit one canonical asset",
-          "Every change is versioned and reversible"
-        ], "statement"),
-        slide("slide-2", "The operating model", [
-          "Agent chooses the right action or workflow",
-          "Workflow owns retries, waits, approvals, and fan-out",
-          "Project owns the editable result"
-        ], "bullets"),
-        slide("slide-3", "Cloudflare-native control plane", [
-          "Durable Objects for project and session state",
-          "Workflows for long-running generation",
-          "Computer Workspace for project files",
-          "Workers AI and R2 for real generation and artifacts"
-        ], "two_column")
-      ]
+      deck: {
+        title: "AI Product Strategy",
+        theme: createPptistTheme(),
+        slides: [
+          textSlide("AI-native creation is becoming a workspace", [
+            "Projects persist longer than conversations",
+            "Agents, workflows, and humans edit one canonical asset",
+            "Every change is versioned and reversible"
+          ]),
+          textSlide("The operating model", [
+            "Agent chooses the right action or workflow",
+            "Workflow owns retries, waits, approvals, and fan-out",
+            "Project owns the editable result"
+          ]),
+          textSlide("Cloudflare-native control plane", [
+            "Durable Objects for project and session state",
+            "Workflows for long-running generation",
+            "Computer Workspace for project files",
+            "Workers AI and R2 for real generation and artifacts"
+          ])
+        ]
+      }
     }
   };
 }

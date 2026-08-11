@@ -8,9 +8,13 @@
   "observability": { "enabled": true, "head_sampling_rate": 1 },
   "vars": {
     "LLM_MODEL": "@cf/moonshotai/kimi-k2.6",
-    "IMAGE_MODEL": "@cf/black-forest-labs/flux-1-schnell"
+    "IMAGE_MODEL": "@cf/black-forest-labs/flux-1-schnell",
+    "PUBLIC_ORIGIN": "https://cloudflare-creative-agent-demos.cottom-zw.workers.dev"
   },
   "ai": { "binding": "AI", "remote": true },
+  // Browser Run: the durable build workflow drives PPTist's layout engine
+  // headlessly, since that engine only exists in a browser.
+  "browser": { "binding": "BROWSER" },
   "r2_buckets": [
     { "binding": "ARTIFACTS", "bucket_name": "creative-agent-demo-artifacts" }
   ],

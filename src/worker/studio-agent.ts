@@ -3,13 +3,6 @@ import { tool, type ToolSet, type UIMessage } from "ai";
 import { z } from "zod";
 import { PPT_THEMES } from "../shared/themes";
 import { uiSpecSchema } from "../shared/ui-schema";
-import {
-  createShapeElement,
-  createTableElement,
-  createTextElement,
-  elementsFromLayout,
-  nextZ
-} from "../shared/slide-elements";
 import { studioAgentName } from "../shared/policy";
 import type {
   CanvasCommand,
@@ -27,14 +20,12 @@ import type {
   ProjectKind,
   ProjectState,
   SessionMeta,
-  SlideElement,
-  SlideElementPatch,
   StudioAgentConfig,
   WorkflowProgressPayload,
   WorkflowRun
 } from "../shared/types";
-import { savePresentationExport } from "./lib/artifacts";
-import { workersLanguageModel } from "./lib/ai";
+import { savePresentationExport, saveSlideImage } from "./lib/artifacts";
+import { generateImageBytes, workersLanguageModel } from "./lib/ai";
 import {
   applyProjectMutation,
   getProjectStub,
@@ -82,6 +73,16 @@ function toJsonValue(value: unknown): JsonValue {
   } catch {
     return null;
   }
+}
+
+/** Deterministic seed so regenerating the same prompt yields the same art. */
+function stableImageSeed(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return Math.abs(hash >>> 0) || 1;
 }
 
 const MAX_MUTATION_ATTEMPTS = 4;
@@ -460,130 +461,35 @@ export class StudioAgent extends Think<Env> {
     if (config?.kind === "ppt") {
       return {
         ...common,
-        update_ppt_slide: tool({
-          description: "Update one existing slide. Use the selected slide when the user says this slide.",
+        // The PPTist controller lives in the browser, so these tools have no
+        // server `execute`: the client runs them against the live editor and
+        // returns the result through `addToolOutput`. That keeps one editing
+        // engine rather than a server-side reimplementation of its commands.
+        pptist_domains: tool({
+          description: "List the PPTist editor's command domains (deck, slides, elements, text, shapes, animations, tables, charts, images, notes, view, export…). Start here to discover what you can do.",
+          inputSchema: z.object({})
+        }),
+        pptist_describe: tool({
+          description: "Describe one PPTist command: its payload shape, constraints and notes. Call before executing an unfamiliar command.",
+          inputSchema: z.object({ commandType: z.string().min(3).max(80) })
+        }),
+        pptist_state: tool({
+          description: "Read the live editor state: slide count, current slide, selection and viewport.",
+          inputSchema: z.object({})
+        }),
+        pptist_execute: tool({
+          description: [
+            "Execute PPTist commands against the open deck — this is the main way to edit a presentation.",
+            "Pass a list and they run as one batch.",
+            "Command types look like 'slides.add', 'elements.updateProps', 'text.setContent', 'animations.add'.",
+            "Use pptist_domains and pptist_describe first when unsure of a payload."
+          ].join(" "),
           inputSchema: z.object({
-            slideId: z.string(),
-            title: z.string().optional(),
-            subtitle: z.string().optional(),
-            body: z.array(z.string()).optional(),
-            notes: z.string().optional(),
-            layout: z.enum(["title", "statement", "bullets", "two_column", "metrics"]).optional()
-          }),
-          execute: async ({ slideId, ...patch }) => this.applyCommands([
-            { type: "ppt.update_slide", slideId, patch } as PptCommand
-          ], `Updated slide ${slideId}`, "agent")
-        }),
-        add_ppt_slide: tool({
-          description: "Add an editable slide to the current presentation.",
-          inputSchema: z.object({
-            title: z.string(),
-            body: z.array(z.string()).min(1),
-            subtitle: z.string().optional(),
-            notes: z.string().optional(),
-            layout: z.enum(["title", "statement", "bullets", "two_column", "metrics"]).default("bullets"),
-            index: z.number().int().nonnegative().optional()
-          }),
-          execute: async ({ index, ...slide }) => this.applyCommands([{
-            type: "ppt.add_slide",
-            index,
-            slide: { id: `slide-${crypto.randomUUID()}`, elements: [], ...slide }
-          }], `Added slide: ${slide.title}`, "agent")
-        }),
-        set_ppt_theme: tool({
-          description: "Change the presentation theme without changing slide content.",
-          inputSchema: z.object({ themeId: z.enum(["midnight", "editorial", "minimal", "sunrise"]) }),
-          execute: async ({ themeId }) => this.applyCommands([
-            { type: "ppt.set_theme", theme: PPT_THEMES[themeId] }
-          ], `Changed presentation theme to ${themeId}`, "agent")
-        }),
-        convert_slide_to_elements: tool({
-          description: "Turn a fixed-layout slide into freely positionable elements. Required before any element tool can edit that slide.",
-          inputSchema: z.object({ slideId: z.string() }),
-          execute: async ({ slideId }) => {
-            const state = await this.getProjectSnapshot();
-            if (state.kind !== "ppt") throw new Error("Project kind mismatch");
-            const slide = state.document.slides.find((item) => item.id === slideId);
-            if (!slide) throw new Error(`Slide not found: ${slideId}`);
-            if (slide.elements.length) return { ok: true, alreadyFreeform: true, elements: slide.elements.length };
-            const elements = elementsFromLayout(slide, state.document.theme);
-            await this.applyCommands(
-              elements.map((element) => ({ type: "ppt.add_element", slideId, element }) as PptCommand),
-              `Converted slide to ${elements.length} editable elements`,
-              "agent"
-            );
-            return { ok: true, elements: elements.length };
-          }
-        }),
-        add_slide_element: tool({
-          description: "Add a text box, shape, table or image to a freeform slide. Geometry is in inches on a 13.333 x 7.5 slide.",
-          inputSchema: z.object({
-            slideId: z.string(),
-            type: z.enum(["text", "shape", "table"]),
-            x: z.number().min(0).max(13.333),
-            y: z.number().min(0).max(7.5),
-            w: z.number().min(0.15).max(13.333),
-            h: z.number().min(0.15).max(7.5),
-            text: z.string().max(2000).optional(),
-            fontSize: z.number().min(6).max(200).optional(),
-            bold: z.boolean().optional(),
-            color: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
-            shape: z.enum(["rect", "roundRect", "ellipse", "triangle", "line"]).optional(),
-            fill: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
-            rows: z.array(z.array(z.string().max(120)).max(8)).max(10).optional()
-          }),
-          execute: async ({ slideId, type, x, y, w, h, text, fontSize, bold, color, shape, fill, rows }) => {
-            const state = await this.getProjectSnapshot();
-            if (state.kind !== "ppt") throw new Error("Project kind mismatch");
-            const slide = state.document.slides.find((item) => item.id === slideId);
-            if (!slide) throw new Error(`Slide not found: ${slideId}`);
-            if (!slide.elements.length) throw new Error("Slide is still layout-driven; call convert_slide_to_elements first");
-            const z = nextZ(slide.elements);
-            const element: SlideElement =
-              type === "text" ? createTextElement({ x, y, w, h, z, text: text ?? "New text", fontSize: fontSize ?? 18, bold, color })
-                : type === "shape" ? createShapeElement({ x, y, w, h, z, shape: shape ?? "rect", fill: fill ?? "5B6CFF" })
-                : createTableElement({ x, y, w, h, z, ...(rows?.length ? { rows } : {}) });
-            await this.applyCommands([{ type: "ppt.add_element", slideId, element }], `Added ${type} element`, "agent");
-            return { ok: true, elementId: element.id };
-          }
-        }),
-        update_slide_element: tool({
-          description: "Change an existing element's text, style, position, size, rotation or layer.",
-          inputSchema: z.object({
-            slideId: z.string(),
-            elementId: z.string(),
-            text: z.string().max(2000).optional(),
-            fontSize: z.number().min(6).max(200).optional(),
-            bold: z.boolean().optional(),
-            italic: z.boolean().optional(),
-            underline: z.boolean().optional(),
-            color: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
-            fill: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
-            align: z.enum(["left", "center", "right"]).optional(),
-            x: z.number().optional(),
-            y: z.number().optional(),
-            w: z.number().optional(),
-            h: z.number().optional(),
-            rotation: z.number().optional(),
-            z: z.number().optional()
-          }),
-          execute: async ({ slideId, elementId, ...patch }) => {
-            const clean = Object.fromEntries(
-              Object.entries(patch).filter(([, value]) => value !== undefined)
-            ) as SlideElementPatch;
-            await this.applyCommands(
-              [{ type: "ppt.update_element", slideId, elementId, patch: clean }],
-              `Updated element ${elementId}`,
-              "agent"
-            );
-            return { ok: true };
-          }
-        }),
-        delete_slide_element: tool({
-          description: "Remove an element from a slide.",
-          inputSchema: z.object({ slideId: z.string(), elementId: z.string() }),
-          execute: async ({ slideId, elementId }) =>
-            this.applyCommands([{ type: "ppt.delete_element", slideId, elementId }], `Deleted element ${elementId}`, "agent")
+            commands: z.array(z.object({
+              type: z.string().min(3).max(80),
+              payload: z.record(z.string(), z.unknown()).optional()
+            })).min(1).max(24)
+          })
         }),
         build_presentation_workflow: tool({
           description: "Start a durable, human-reviewed workflow to create or substantially rebuild a presentation.",

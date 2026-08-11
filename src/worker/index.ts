@@ -10,8 +10,8 @@ import type {
   StudioAgentConfig
 } from "../shared/types";
 import { getProjectStub, listWorkspace, readProject, syncProjectWorkspace } from "./lib/project-access";
-import { DEFAULT_IMAGE_MODEL, DEFAULT_LLM_MODEL } from "./lib/ai";
-import { savePresentationExport } from "./lib/artifacts";
+import { DEFAULT_IMAGE_MODEL, DEFAULT_LLM_MODEL, generateImageBytes } from "./lib/ai";
+import { savePresentationExport, saveSlideImage } from "./lib/artifacts";
 import { isServableArtifactKey } from "../shared/policy";
 import { StudioAgent, studioAgentName } from "./studio-agent";
 
@@ -178,6 +178,17 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
     }
     if (parts.length === 5 && parts[4] === "workspace" && method === "GET") {
       return json({ files: await listWorkspace(env, kind, projectId) });
+    }
+    // Editor-side image generation. Mirrors the agent's `generate_slide_image`
+    // so the human and the model produce identical artifacts.
+    if (parts.length === 5 && parts[4] === "generate-image" && kind === "ppt" && method === "POST") {
+      const body = await readJson<{ slideId: string; prompt: string }>(request);
+      if (!body.slideId || !body.prompt?.trim()) throw new HttpError(400, "slideId and prompt are required");
+      const state = await readProject(env, "ppt", projectId);
+      if (state.kind !== "ppt") throw new HttpError(400, "Not a PPT project");
+      const bytes = await generateImageBytes(env, body.prompt.trim(), Math.floor(Math.random() * 1_000_000) + 1);
+      const saved = await saveSlideImage(env, state, body.slideId, bytes, body.prompt.trim());
+      return json({ assetKey: saved.key, artifact: saved.artifact }, 201);
     }
     if (parts.length === 5 && parts[4] === "export" && kind === "ppt" && method === "POST") {
       const state = await readProject(env, "ppt", projectId);

@@ -1,6 +1,12 @@
 import { withWorkspace, type WorkspaceOptions } from "@cloudflare/computer";
 import { DurableObject } from "cloudflare:workers";
 import { applyMutation } from "../../shared/reducers";
+import {
+  pptistDeckFromLegacy,
+  pptistSlideTitle,
+  PPTIST_VIEWPORT_RATIO,
+  PPTIST_VIEWPORT_SIZE
+} from "../../shared/pptist";
 import { createInitialCanvasState, createInitialPptState } from "../../shared/seeds";
 import type {
   CanvasProjectState,
@@ -47,9 +53,27 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
     return this.ctx.storage;
   }
 
+  /**
+   * Upgrade state written before PPTist became the canonical model.
+   *
+   * Applied on every read path, and persisted the first time it fires, so a
+   * project opened after the change is migrated exactly once.
+   */
+  private async migrate(state: TState): Promise<TState> {
+    if (state.kind !== "ppt") return state;
+    const document = state.document as { deck?: unknown };
+    if (document.deck) return state;
+    const migrated = {
+      ...state,
+      document: { ...state.document, deck: pptistDeckFromLegacy(state.document as never) }
+    } as TState;
+    await this.ctx.storage.put(STATE_KEY, migrated);
+    return migrated;
+  }
+
   async initialize(projectId: string): Promise<TState> {
     const stored = await this.ctx.storage.get<TState>(STATE_KEY);
-    if (stored) return structuredClone(stored);
+    if (stored) return structuredClone(await this.migrate(stored));
     const initial = this.createInitialState(projectId);
     await this.ctx.storage.put(STATE_KEY, initial);
     return structuredClone(initial);
@@ -57,7 +81,7 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
 
   protected async ensureState(): Promise<TState> {
     const stored = await this.ctx.storage.get<TState>(STATE_KEY);
-    if (stored) return stored;
+    if (stored) return this.migrate(stored);
     const initial = this.createInitialState(this.ctx.id.toString());
     await this.ctx.storage.put(STATE_KEY, initial);
     return initial;
@@ -221,7 +245,10 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
     const state = await this.ensureState();
     const selectedIds = new Set(selection?.ids ?? (selection?.activeId ? [selection.activeId] : []));
     if (state.kind === "ppt") {
-      const selected = selectedIds.size ? state.document.slides.filter((slide) => selectedIds.has(slide.id)) : [];
+      const deck = state.document.deck;
+      const selected = selectedIds.size
+        ? deck.slides.filter((slide) => selectedIds.has(slide.id))
+        : [];
       return JSON.stringify({
         project: {
           id: state.id,
@@ -231,31 +258,24 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
           title: state.document.title,
           objective: state.document.objective,
           audience: state.document.audience,
-          theme: state.document.theme,
-          slideSize: { widthIn: 13.333, heightIn: 7.5 },
-          slides: state.document.slides.map((slide, index) => ({
+          // The deck is PPTist's model. Only a summary is sent: full element
+          // JSON would dominate the context, and the agent reads live detail
+          // through the PPTist bridge instead.
+          editor: "pptist",
+          viewport: { width: PPTIST_VIEWPORT_SIZE, ratio: PPTIST_VIEWPORT_RATIO },
+          theme: deck.theme,
+          slideCount: deck.slides.length,
+          slides: deck.slides.map((slide, index) => ({
             index: index + 1,
             id: slide.id,
-            title: slide.title,
-            layout: slide.layout,
-            bodyPreview: slide.body.slice(0, 4),
-            // Freeform slides are edited element-by-element, so the agent needs
-            // ids and geometry to target them; layout slides have none yet.
-            freeform: slide.elements.length > 0,
-            elements: slide.elements.map((element) => ({
-              id: element.id,
-              type: element.type,
-              x: element.x,
-              y: element.y,
-              w: element.w,
-              h: element.h,
-              z: element.z,
-              ...(element.type === "text" ? { text: element.text.slice(0, 160), fontSize: element.fontSize } : {}),
-              ...(element.type === "shape" ? { shape: element.shape, fill: element.fill } : {})
-            }))
+            type: slide.type,
+            title: pptistSlideTitle(slide),
+            elementCount: slide.elements.length,
+            elementTypes: [...new Set(slide.elements.map((element) => element.type))],
+            remark: slide.remark?.slice(0, 200)
           }))
         },
-        selection: selected
+        selection: selected.map((slide) => ({ id: slide.id, title: pptistSlideTitle(slide) }))
       });
     }
     const selected = selectedIds.size ? state.document.nodes.filter((node) => selectedIds.has(node.id)) : [];

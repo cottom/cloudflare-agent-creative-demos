@@ -105,6 +105,12 @@ export const api = {
       body: JSON.stringify({ reason })
     }),
 
+  generateSlideImage: (projectId: string, slideId: string, prompt: string) =>
+    request<{ assetKey: string; artifact: { key: string; name: string } }>(`/api/projects/ppt/${encodeURIComponent(projectId)}/generate-image`, {
+      method: "POST",
+      body: JSON.stringify({ slideId, prompt })
+    }),
+
   exportPpt: (projectId: string) =>
     request<{ artifact: { key: string; name: string }; url: string }>(`/api/projects/ppt/${encodeURIComponent(projectId)}/export`, {
       method: "POST",
