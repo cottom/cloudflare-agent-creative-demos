@@ -14,6 +14,10 @@ const root = document.getElementById("root")!;
  */
 if (window.location.pathname === "/compose") {
   void import("./compose").then(({ mountComposer }) => mountComposer(root));
+} else if (window.location.pathname === "/embed") {
+  // The embeddable editor a host page loads in an iframe. Also a route rather
+  // than an entry, and also lazy — the studio never pays for it.
+  void import("./embed").then(({ mountEmbed }) => mountEmbed(root));
 } else {
   createRoot(root).render(
     <StrictMode><App /></StrictMode>

@@ -13,7 +13,8 @@ import { getProjectStub, listWorkspace, readProject, syncProjectWorkspace } from
 import { DEFAULT_IMAGE_MODEL, DEFAULT_LLM_MODEL, generateImageBytes } from "./lib/ai";
 import { savePresentationExport, saveSlideImage } from "./lib/artifacts";
 import { isServableArtifactKey } from "../shared/policy";
-import { ApiError, handleV1 } from "./platform/v1";
+import { handleAdminApi } from "./public/admin";
+import { handlePublicApi } from "./public/api";
 import { StudioAgent, studioAgentName } from "./studio-agent";
 
 export { PptProject, CanvasProject } from "./project/project-do";
@@ -266,18 +267,23 @@ export default {
   // loses its binding and throws "Illegal invocation" at runtime.
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
-      const v1 = await handleV1(request, env, ctx);
-      if (v1) return v1;
+      // Admin is matched first: it shares the /v1 prefix but authenticates
+      // against a deployment secret rather than a workspace credential.
+      const admin = await handleAdminApi(request, env);
+      if (admin) return admin;
 
-      const api = await handleApi(request, env, ctx);
+      const api = await handlePublicApi(request, env, ctx);
       if (api) return api;
+
+      const demo = await handleApi(request, env, ctx);
+      if (demo) return demo;
 
       const agentResponse = await routeAgentRequest(request, env, { prefix: "agents" });
       if (agentResponse) return agentResponse;
 
       return env.ASSETS.fetch(request);
     } catch (error) {
-      const status = error instanceof HttpError || error instanceof ApiError ? error.status : 500;
+      const status = error instanceof HttpError ? error.status : 500;
       // Structured logs are queryable in Workers Logs; a bare string is not.
       console.error(JSON.stringify({
         event: "request_failed",
@@ -289,7 +295,6 @@ export default {
       }));
       // Only deliberate HTTP errors carry a caller-facing message; anything
       // else is an internal fault and its text is not echoed back.
-      if (error instanceof ApiError) return json({ error: error.message, detail: error.detail }, status);
       if (error instanceof HttpError) return json({ error: error.message }, status);
       return json({ error: "Internal error" }, 500);
     }

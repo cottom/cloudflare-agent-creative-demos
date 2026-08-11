@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Creative Agent — integration example</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0;
+    font: 15px/1.55 system-ui, sans-serif;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    height: 100vh;
+  }
+  header {
+    padding: .75rem 1rem;
+    border-bottom: 1px solid rgba(128,128,128,.35);
+    display: flex;
+    gap: .6rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  h1 { font-size: .95rem; margin: 0 auto 0 0; font-weight: 650; }
+  button {
+    font: inherit;
+    padding: .35rem .7rem;
+    border-radius: 6px;
+    border: 1px solid rgba(128,128,128,.5);
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  button:hover { border-color: currentColor; }
+  main { display: grid; grid-template-columns: 1fr 22rem; min-height: 0; }
+  #editor { min-width: 0; }
+  #log {
+    border-left: 1px solid rgba(128,128,128,.35);
+    padding: .75rem;
+    overflow: auto;
+    font: 12px/1.5 ui-monospace, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .row { padding: .2rem 0; border-bottom: 1px solid rgba(128,128,128,.18); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Host application (integration example)</h1>
+  <button id="save">Save</button>
+  <button id="get">Get content</button>
+  <button id="ask">Ask the agent</button>
+  <button id="run">Generate deck</button>
+</header>
+<main>
+  <div id="editor"></div>
+  <div id="log" aria-live="polite"></div>
+</main>
+
+<script type="module">
+/**
+ * A host page embedding the editor.
+ *
+ * The token is read from the query string purely so this example can be opened
+ * by hand. A real host mints an embed session on its own server, where the API
+ * key lives, and passes the short-lived token to the browser — the API key
+ * itself must never reach a page.
+ */
+import { CreativeAgent } from "/sdk.js";
+
+const log = document.getElementById("log");
+function write(label, payload) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.textContent = `${label} ${payload === undefined ? "" : JSON.stringify(payload).slice(0, 220)}`;
+  log.prepend(row);
+}
+
+const token = new URLSearchParams(location.search).get("token");
+if (!token) {
+  write("error", "Open this page with ?token=<embed session token>");
+} else {
+  const editor = CreativeAgent.mount(document.getElementById("editor"), { token });
+  const api = CreativeAgent.client({ token });
+
+  editor.on("*", (event) => write(`event:${event.type}`, event));
+  editor.ready.then((ready) => write("ready", ready));
+
+  document.getElementById("save").onclick = () => editor.save();
+  document.getElementById("get").onclick = () => editor.getContent();
+  document.getElementById("ask").onclick = () =>
+    editor.sendMessage("Tighten the wording on the opening slide.");
+
+  document.getElementById("run").onclick = async () => {
+    const { assetId } = await editor.ready;
+    const run = await api.runs.start(assetId, "presentation.generate", {
+      brief: "A short deck on why teams adopt an internal developer platform",
+      slideCount: 5
+    });
+    write("run:started", run);
+    // Flows pause for a human decision; approving it here keeps the example
+    // running unattended.
+    const final = await api.runs.wait(assetId, run.id, {
+      onProgress: (r) => write(`run:${r.status}`, { progress: r.progress, message: r.message }),
+      onAction: (action) => {
+        write("run:action", { title: action.title });
+        return { approved: true };
+      }
+    });
+    write("run:final", { status: final.status });
+  };
+}
+</script>
+</body>
+</html>

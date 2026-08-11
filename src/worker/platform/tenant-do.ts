@@ -107,6 +107,21 @@ export class Tenant extends DurableObject<Env> {
         );
         CREATE INDEX IF NOT EXISTS projects_kind_updated
           ON projects (kind, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS idempotency (
+          key TEXT PRIMARY KEY,
+          fingerprint TEXT NOT NULL,
+          status INTEGER NOT NULL,
+          body TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS runs (
+          public_id TEXT PRIMARY KEY,
+          asset_id TEXT NOT NULL,
+          instance_id TEXT NOT NULL,
+          flow TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS runs_asset ON runs (asset_id, created_at DESC);
       `);
     });
   }
@@ -298,6 +313,83 @@ export class Tenant extends DurableObject<Env> {
       projectId
     );
     return cursor.rowsWritten > 0;
+  }
+
+  // ---- Idempotency ----------------------------------------------------
+
+  /**
+   * Replay protection for POSTs.
+   *
+   * A client that times out cannot tell a lost request from a lost response, so
+   * it retries — and without this, a retried "create asset" silently makes two.
+   * The fingerprint is checked as well as the key: reusing one key for a
+   * *different* payload is a client bug, and returning the first response for
+   * it would hide that bug behind a plausible success.
+   */
+  async replayIdempotent(
+    key: string,
+    fingerprint: string
+  ): Promise<{ status: number; body: string } | { conflict: true } | null> {
+    const row = this.ctx.storage.sql
+      .exec<{ fingerprint: string; status: number; body: string }>(
+        `SELECT fingerprint, status, body FROM idempotency WHERE key = ?`,
+        key
+      )
+      .toArray()[0];
+    if (!row) return null;
+    if (row.fingerprint !== fingerprint) return { conflict: true };
+    return { status: row.status, body: row.body };
+  }
+
+  async recordIdempotent(key: string, fingerprint: string, status: number, body: string): Promise<void> {
+    this.ctx.storage.sql.exec(
+      `INSERT OR REPLACE INTO idempotency (key, fingerprint, status, body, created_at) VALUES (?, ?, ?, ?, ?)`,
+      key,
+      fingerprint,
+      status,
+      body,
+      new Date().toISOString()
+    );
+  }
+
+  // ---- Runs -----------------------------------------------------------
+
+  /**
+   * Public run id ⇄ workflow instance id.
+   *
+   * The engine's instance id is an implementation detail with its own format;
+   * handing it out would make swapping the engine a breaking API change.
+   */
+  async recordRun(publicId: string, assetId: string, instanceId: string, flow: string): Promise<void> {
+    this.ctx.storage.sql.exec(
+      `INSERT OR REPLACE INTO runs (public_id, asset_id, instance_id, flow, created_at) VALUES (?, ?, ?, ?, ?)`,
+      publicId,
+      assetId,
+      instanceId,
+      flow,
+      new Date().toISOString()
+    );
+  }
+
+  async resolveRun(publicId: string): Promise<{ assetId: string; instanceId: string; flow: string } | null> {
+    const row = this.ctx.storage.sql
+      .exec<{ asset_id: string; instance_id: string; flow: string }>(
+        `SELECT asset_id, instance_id, flow FROM runs WHERE public_id = ?`,
+        publicId
+      )
+      .toArray()[0];
+    return row ? { assetId: row.asset_id, instanceId: row.instance_id, flow: row.flow } : null;
+  }
+
+  async listRuns(assetId: string, limit = 20): Promise<Array<{ publicId: string; instanceId: string; flow: string }>> {
+    return this.ctx.storage.sql
+      .exec<{ public_id: string; instance_id: string; flow: string }>(
+        `SELECT public_id, instance_id, flow FROM runs WHERE asset_id = ? ORDER BY created_at DESC LIMIT ?`,
+        assetId,
+        Math.min(Math.max(limit, 1), 100)
+      )
+      .toArray()
+      .map((row) => ({ publicId: row.public_id, instanceId: row.instance_id, flow: row.flow }));
   }
 
   async stats(): Promise<{ projects: number; byKind: Record<string, number> }> {
