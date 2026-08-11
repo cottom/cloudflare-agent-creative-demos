@@ -54,16 +54,35 @@ function optionValues(payload: JsonObject, key: string): string[] | undefined {
 /**
  * Derive the contract for an interaction.
  *
- * Approval-style interactions all share one required decision plus whatever
- * the publisher declared editable; anything not named is not accepted, which
- * is what makes `editableFields` a boundary instead of documentation.
+ * A contract is whatever the publisher already declared editable, plus the
+ * bookkeeping fields every caller may send. Anything not named is refused,
+ * which is what makes `editableFields` a boundary instead of documentation.
  */
 export function contractFor(interaction: Pick<ProjectInteraction, "kind" | "payload">): ResponseContract {
   const payload = interaction.payload ?? {};
+  /**
+   * Nothing is required.
+   *
+   * The accept/decline decision is carried by which endpoint the caller hits,
+   * not by a field in the body — the shipped UI approves a plan review by
+   * sending `{themeId, direction, slides}` with no verdict in it at all. An
+   * earlier version of this contract required `approved` and so rejected every
+   * approval the product actually makes; `approved` is accepted because some
+   * callers send it, never demanded.
+   */
   const fields: ContractField[] = [
-    { name: "approved", type: "boolean", required: true },
+    { name: "approved", type: "boolean" },
     { name: "reason", type: "string", maxLength: 500 }
   ];
+
+  // Kinds whose review payload is the editable thing itself, rather than
+  // naming its editable parts in `editableFields`.
+  if (interaction.kind === "canvas_variant_review") {
+    fields.push({ name: "directions", type: "string", opaque: true });
+  }
+  if (interaction.kind === "form") {
+    fields.push({ name: "values", type: "string", opaque: true });
+  }
 
   const editable = optionValues(payload, "editableFields") ?? [];
   for (const name of editable) {
@@ -83,6 +102,7 @@ export function contractFor(interaction: Pick<ProjectInteraction, "kind" | "payl
 
   if (interaction.kind === "choice" || interaction.kind === "multi_select") {
     fields.push({ name: "selected", type: "string", enum: optionValues(payload, "options"), maxLength: 80 });
+    fields.push({ name: "values", type: "string", opaque: true });
     fields.push({ name: "selectedValues", type: "string[]", enum: optionValues(payload, "options") });
     fields.push({ name: "path", type: "string", maxLength: 80 });
   }

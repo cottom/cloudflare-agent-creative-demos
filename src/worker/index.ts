@@ -250,7 +250,16 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
       }
       if (parts[6] === "interactions" && parts[7] && parts[8] === "resolve" && method === "POST") {
         const body = await readJson<{ response: JsonObject }>(request);
-        return json(await agent.resolveInteraction(decodeURIComponent(parts[7]), body.response));
+        try {
+          return json(await agent.resolveInteraction(decodeURIComponent(parts[7]), body.response));
+        } catch (error) {
+          // RPC flattens the error class, so the message carries the meaning.
+          const message = error instanceof Error ? error.message : String(error);
+          if (/^Interaction not found/.test(message)) throw new HttpError(404, message);
+          if (/no longer be resumed|has expired/.test(message)) throw new HttpError(409, message);
+          if (/does not match this interaction/.test(message)) throw new HttpError(422, message);
+          throw error;
+        }
       }
       if (parts[6] === "interactions" && parts[7] && parts[8] === "reject" && method === "POST") {
         const body = await readJson<{ reason?: string }>(request);

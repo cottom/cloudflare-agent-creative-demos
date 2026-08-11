@@ -631,6 +631,10 @@ async function handleRuns(
       if (message.includes("has expired")) {
         throw problem.conflict("This action expired before it was answered and is no longer accepted.");
       }
+      if (message.startsWith("Interaction not found")) throw problem.notFound("This action");
+      if (message.includes("can no longer be resumed")) {
+        throw problem.conflict("The run behind this action is no longer available; it has been cancelled.");
+      }
       if (message.includes("does not match this interaction")) {
         throw problem.validation([{ field: "response", message: "Does not match the action's declared schema" }]);
       }

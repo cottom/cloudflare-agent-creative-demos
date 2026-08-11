@@ -25,8 +25,10 @@ describe("submission contract", () => {
     expect(check({ approved: true, themeId: "editorial", direction: "Tighten it" })).toEqual([]);
   });
 
-  it("requires the decision itself", () => {
-    expect(check({ themeId: "editorial" })).toContainEqual({ field: "approved", message: "Required" });
+  it("does not demand a verdict field, because the endpoint is the verdict", () => {
+    // The shipped UI approves by sending only its edits; requiring `approved`
+    // here once rejected every approval the product actually makes.
+    expect(check({ themeId: "editorial" })).toEqual([]);
   });
 
   it("rejects a value outside the offered set", () => {
@@ -54,6 +56,11 @@ describe("submission contract", () => {
     expect(violations.length).toBeGreaterThanOrEqual(3);
   });
 
+  it("accepts a verdict when a caller does send one", () => {
+    expect(check({ approved: true })).toEqual([]);
+    expect(check({ approved: false, reason: "Not yet" })).toEqual([]);
+  });
+
   it("passes structured edits through without inventing a shape for them", () => {
     // "slides" is editable but its shape belongs to the workflow that published it.
     expect(check({ approved: true, slides: [{ title: "One" }] as never })).toEqual([]);
@@ -73,8 +80,8 @@ describe("submission contract", () => {
 
   it("constrains a choice to its offered options", () => {
     const contract = contractFor({ kind: "choice", payload: { options: ["a", "b"] } });
-    expect(validateSubmission(contract, { approved: true, selected: "a" } as never)).toEqual([]);
-    expect(validateSubmission(contract, { approved: true, selected: "c" } as never)).toContainEqual({
+    expect(validateSubmission(contract, { selected: "a" } as never)).toEqual([]);
+    expect(validateSubmission(contract, { selected: "c" } as never)).toContainEqual({
       field: "selected",
       message: "Not one of the offered choices"
     });

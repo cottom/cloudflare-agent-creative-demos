@@ -1,3 +1,4 @@
+import { getAgentByName } from "agents";
 import { Session, Think } from "@cloudflare/think";
 import { tool, type ToolSet, type UIMessage } from "ai";
 import { z } from "zod";
@@ -15,6 +16,13 @@ import { isExpired } from "../shared/interaction-expiry";
 export class InteractionContractError extends Error {
   constructor(public violations: ContractViolation[]) {
     super("Submission does not match this interaction's contract");
+  }
+}
+
+/** The run behind an interaction can no longer be resumed. */
+export class InteractionUnresumableError extends Error {
+  constructor(interactionId: string) {
+    super(`Interaction ${interactionId} can no longer be resumed`);
   }
 }
 
@@ -124,6 +132,12 @@ function mapWorkflowStatus(status: string | undefined): WorkflowRun["status"] {
   if (status === "queued") return "queued";
   return "running";
 }
+
+/** The subset of the agent reachable over RPC when delegating. */
+type StudioAgentStub = {
+  resolveInteraction(interactionId: string, response: JsonObject): Promise<ProjectInteraction>;
+  rejectInteraction(interactionId: string, reason: string): Promise<ProjectInteraction>;
+};
 
 export type WorkflowBindingName = "PPT_BUILD_WORKFLOW" | "CANVAS_VARIANTS_WORKFLOW";
 
@@ -296,6 +310,9 @@ export class StudioAgent extends Think<Env> {
     const stub = getProjectStub(this.env, config.kind, config.projectId);
     const interaction = await stub.getInteraction(interactionId);
     if (!interaction) throw new Error(`Interaction not found: ${interactionId}`);
+    const owner = await this.delegateToOwner(interaction, (agent) =>
+      agent.resolveInteraction(interactionId, response));
+    if (owner) return owner;
     // Already answered. Returning the settled record rather than applying a
     // second submission is what makes an at-least-once retry safe.
     if (interaction.status !== "pending") return interaction;
@@ -307,10 +324,11 @@ export class StudioAgent extends Think<Env> {
     if (violations.length) throw new InteractionContractError(violations);
 
     if (interaction.workflowId) {
-      await this.approveWorkflow(interaction.workflowId, {
-        reason: "Approved from project interaction UI",
-        metadata: { interactionId, response }
-      });
+      await this.resumeOrSettle(interaction, () =>
+        this.approveWorkflow(interaction.workflowId!, {
+          reason: "Approved from project interaction UI",
+          metadata: { interactionId, response }
+        }));
     } else {
       const messageId = `interaction-response-${interactionId}`;
       await this.submitMessages([{
@@ -335,8 +353,14 @@ export class StudioAgent extends Think<Env> {
     const stub = getProjectStub(this.env, config.kind, config.projectId);
     const interaction = await stub.getInteraction(interactionId);
     if (!interaction) throw new Error(`Interaction not found: ${interactionId}`);
+    const owner = await this.delegateToOwner(interaction, (agent) =>
+      agent.rejectInteraction(interactionId, reason));
+    if (owner) return owner;
     if (interaction.status !== "pending") return interaction;
-    if (interaction.workflowId) await this.rejectWorkflow(interaction.workflowId, { reason });
+    if (interaction.workflowId) {
+      await this.resumeOrSettle(interaction, () =>
+        this.rejectWorkflow(interaction.workflowId!, { reason }));
+    }
     return stub.resolveInteraction(interactionId, { reason }, "cancelled");
   }
 
@@ -349,6 +373,67 @@ export class StudioAgent extends Think<Env> {
    * instance is what actually halts execution; recording the status only makes
    * it visible, so it is done second and the terminate failure is not swallowed.
    */
+  /**
+   * Resume the workflow behind an interaction, or retire the interaction.
+   *
+   * A workflow can outlive its ability to be resumed — terminated, expired, or
+   * lost with the tracking state that pointed at it. That used to surface as a
+   * 500 on every attempt, forever, with the approval still sitting in the UI
+   * inviting the next one. An unresumable interaction is instead settled as
+   * cancelled and reported as gone: the run is not coming back, and the queue
+   * should stop pretending otherwise.
+   */
+  private async resumeOrSettle(interaction: ProjectInteraction, resume: () => Promise<unknown>): Promise<void> {
+    try {
+      await resume();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/not found in tracking table|instance not found|already (completed|terminated)/i.test(message)) {
+        throw error;
+      }
+      const stub = getProjectStub(this.env, this.requireConfig().kind, this.requireConfig().projectId);
+      await stub.resolveInteraction(
+        interaction.id,
+        { reason: "The run behind this request is no longer available" },
+        "cancelled"
+      );
+      console.warn(JSON.stringify({
+        event: "interaction_unresumable",
+        interactionId: interaction.id,
+        workflowId: interaction.workflowId,
+        error: message
+      }));
+      throw new InteractionUnresumableError(interaction.id);
+    }
+  }
+
+  /**
+   * Hand an interaction to the session that can actually resume it.
+   *
+   * Interactions live on the project, which every session of that project can
+   * see, but a workflow can only be resumed by the agent that started it —
+   * resumption state is per-session. So answering a pending approval from any
+   * other session (a second tab, a new chat, the demo plane's fixed session
+   * name) reached the right record and then failed with "not found in tracking
+   * table", surfaced as an opaque 500.
+   *
+   * The interaction already names its owner, so this routes by that rather than
+   * by whichever session the caller happened to come through. Returns null when
+   * this agent *is* the owner, which is what terminates the hop.
+   */
+  private async delegateToOwner(
+    interaction: ProjectInteraction,
+    run: (agent: StudioAgentStub) => Promise<ProjectInteraction>
+  ): Promise<ProjectInteraction | null> {
+    const config = this.requireConfig();
+    if (!interaction.sessionId || interaction.sessionId === config.sessionId) return null;
+    const agent = await getAgentByName<Env, StudioAgent>(
+      this.env.STUDIO_AGENT,
+      studioAgentName(config.kind, config.projectId, interaction.sessionId)
+    );
+    return run(agent as unknown as StudioAgentStub);
+  }
+
   async cancelWorkflow(instanceId: string, binding: WorkflowBindingName, reason: string) {
     const workflow = this.env[binding];
     const instance = await workflow.get(instanceId);
