@@ -1,5 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 import { sha256Hex, timingSafeEqualHex, type Scope } from "./auth";
+import {
+  generateWebhookSecret,
+  isWebhookEvent,
+  MAX_ATTEMPTS,
+  nextAttemptDelaySeconds,
+  signPayload
+} from "./webhooks";
 
 /**
  * Per-tenant control plane: API keys and the project index.
@@ -80,6 +87,53 @@ function toKey(row: KeyRow): ApiKeyRecord {
   };
 }
 
+export type WebhookRecord = {
+  id: string;
+  url: string;
+  events: string[];
+  createdAt: string;
+  disabledAt: string | null;
+};
+
+export type DeliveryRecord = {
+  id: string;
+  webhookId: string;
+  event: string;
+  status: string;
+  attempts: number;
+  lastError: string | null;
+};
+
+type WebhookRow = {
+  id: string;
+  url: string;
+  secret: string;
+  events: string;
+  created_at: string;
+  disabled_at: string | null;
+};
+
+type DeliveryRow = {
+  id: string;
+  webhook_id: string;
+  event: string;
+  body: string;
+  attempts: number;
+  due_at: number;
+  status: string;
+  last_error: string | null;
+};
+
+function toWebhook(row: WebhookRow): WebhookRecord {
+  return {
+    id: row.id,
+    url: row.url,
+    events: JSON.parse(row.events) as string[],
+    createdAt: row.created_at,
+    disabledAt: row.disabled_at
+  };
+}
+
 export class Tenant extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -122,6 +176,25 @@ export class Tenant extends DurableObject<Env> {
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS runs_asset ON runs (asset_id, created_at DESC);
+        CREATE TABLE IF NOT EXISTS webhooks (
+          id TEXT PRIMARY KEY,
+          url TEXT NOT NULL,
+          secret TEXT NOT NULL,
+          events TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          disabled_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS deliveries (
+          id TEXT PRIMARY KEY,
+          webhook_id TEXT NOT NULL,
+          event TEXT NOT NULL,
+          body TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          due_at INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          last_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries (status, due_at);
       `);
     });
   }
@@ -390,6 +463,231 @@ export class Tenant extends DurableObject<Env> {
       )
       .toArray()
       .map((row) => ({ publicId: row.public_id, instanceId: row.instance_id, flow: row.flow }));
+  }
+
+  // ---- Webhooks -------------------------------------------------------
+
+  async registerWebhook(url: string, events: string[]): Promise<WebhookRecord & { secret: string }> {
+    const secret = generateWebhookSecret();
+    const record: WebhookRecord = {
+      id: `wh_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+      url,
+      events: events.filter(isWebhookEvent),
+      createdAt: new Date().toISOString(),
+      disabledAt: null
+    };
+    this.ctx.storage.sql.exec(
+      `INSERT INTO webhooks (id, url, secret, events, created_at, disabled_at) VALUES (?, ?, ?, ?, ?, NULL)`,
+      record.id,
+      record.url,
+      secret,
+      JSON.stringify(record.events),
+      record.createdAt
+    );
+    // The secret is returned exactly once, like an API key: a receiver that
+    // loses it re-registers rather than reading it back out of us.
+    return { ...record, secret };
+  }
+
+  async listWebhooks(): Promise<WebhookRecord[]> {
+    return this.ctx.storage.sql
+      .exec<WebhookRow>(`SELECT * FROM webhooks ORDER BY created_at DESC`)
+      .toArray()
+      .map(toWebhook);
+  }
+
+  async deleteWebhook(id: string): Promise<boolean> {
+    return this.ctx.storage.sql.exec(`DELETE FROM webhooks WHERE id = ?`, id).rowsWritten > 0;
+  }
+
+  /**
+   * Fan an event out to every subscriber and schedule delivery.
+   *
+   * Writing the delivery rows and returning is deliberate: the caller is a
+   * project object finishing a state change, and it must not wait on a third
+   * party's HTTP endpoint to do it.
+   */
+  async emit(event: string, payload: Record<string, unknown>): Promise<number> {
+    const subscribers = this.ctx.storage.sql
+      .exec<WebhookRow>(`SELECT * FROM webhooks WHERE disabled_at IS NULL`)
+      .toArray()
+      .filter((row) => (JSON.parse(row.events) as string[]).includes(event));
+    if (!subscribers.length) return 0;
+
+    const body = JSON.stringify({
+      id: `evt_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+      object: "event",
+      type: event,
+      created_at: new Date().toISOString(),
+      data: payload
+    });
+    const now = Date.now();
+    for (const subscriber of subscribers) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO deliveries (id, webhook_id, event, body, attempts, due_at, status)
+         VALUES (?, ?, ?, ?, 0, ?, 'pending')`,
+        `del_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        subscriber.id,
+        event,
+        body,
+        now
+      );
+    }
+    await this.scheduleNextDelivery();
+    return subscribers.length;
+  }
+
+  /** One alarm per object, so it always points at the earliest pending row. */
+  private async scheduleNextDelivery(): Promise<void> {
+    const next = this.ctx.storage.sql
+      .exec<{ due_at: number }>(`SELECT MIN(due_at) AS due_at FROM deliveries WHERE status = 'pending'`)
+      .toArray()[0];
+    if (!next?.due_at) return;
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > next.due_at) {
+      await this.ctx.storage.setAlarm(Math.max(next.due_at, Date.now() + 1000));
+    }
+  }
+
+  async alarm(): Promise<void> {
+    const due = this.ctx.storage.sql
+      .exec<DeliveryRow>(
+        `SELECT * FROM deliveries WHERE status = 'pending' AND due_at <= ? ORDER BY due_at LIMIT 20`,
+        Date.now()
+      )
+      .toArray();
+
+    for (const delivery of due) {
+      const webhook = this.ctx.storage.sql
+        .exec<WebhookRow>(`SELECT * FROM webhooks WHERE id = ?`, delivery.webhook_id)
+        .toArray()[0];
+      if (!webhook) {
+        this.ctx.storage.sql.exec(`DELETE FROM deliveries WHERE id = ?`, delivery.id);
+        continue;
+      }
+
+      const attempts = delivery.attempts + 1;
+      let error: string | null = null;
+      try {
+        const timestamp = Math.floor(Date.now() / 1000);
+        const response = await fetch(webhook.url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-signature": await signPayload(webhook.secret, delivery.body, timestamp),
+            "x-event-type": delivery.event,
+            "x-delivery-id": delivery.id,
+            "x-attempt": String(attempts)
+          },
+          body: delivery.body
+        });
+        // Any 2xx is success. A 4xx other than 429 is the receiver saying the
+        // request is wrong, which retrying cannot fix, so it is terminal.
+        if (response.ok) {
+          this.ctx.storage.sql.exec(
+            `UPDATE deliveries SET status = 'delivered', attempts = ? WHERE id = ?`,
+            attempts,
+            delivery.id
+          );
+          continue;
+        }
+        error = `HTTP ${response.status}`;
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+          this.ctx.storage.sql.exec(
+            `UPDATE deliveries SET status = 'failed', attempts = ?, last_error = ? WHERE id = ?`,
+            attempts,
+            error,
+            delivery.id
+          );
+          continue;
+        }
+      } catch (cause) {
+        error = cause instanceof Error ? cause.message : String(cause);
+      }
+
+      const delay = attempts >= MAX_ATTEMPTS ? null : nextAttemptDelaySeconds(attempts);
+      if (delay === null) {
+        this.ctx.storage.sql.exec(
+          `UPDATE deliveries SET status = 'failed', attempts = ?, last_error = ? WHERE id = ?`,
+          attempts,
+          error,
+          delivery.id
+        );
+      } else {
+        this.ctx.storage.sql.exec(
+          `UPDATE deliveries SET attempts = ?, due_at = ?, last_error = ? WHERE id = ?`,
+          attempts,
+          Date.now() + delay * 1000,
+          error,
+          delivery.id
+        );
+      }
+    }
+
+    await this.scheduleNextDelivery();
+  }
+
+  /**
+   * Translate an internal run state change into a public event.
+   *
+   * The project object knows a workflow instance changed status but not what
+   * that run is called publicly, and it must not learn — so the mapping is
+   * resolved here, next to the table that holds it. A run with no mapping was
+   * started outside the public API and is not anyone's to hear about.
+   */
+  async emitRunEvent(input: {
+    assetId: string;
+    instanceId: string;
+    status: string;
+    progress: number;
+    message: string;
+    error?: string;
+  }): Promise<void> {
+    const PUBLIC_STATUS: Record<string, string> = {
+      running: "run.running",
+      waiting: "run.requires_action",
+      complete: "run.succeeded",
+      error: "run.failed"
+    };
+    const event = PUBLIC_STATUS[input.status];
+    if (!event) return;
+    const row = this.ctx.storage.sql
+      .exec<{ public_id: string; flow: string }>(
+        `SELECT public_id, flow FROM runs WHERE instance_id = ?`,
+        input.instanceId
+      )
+      .toArray()[0];
+    if (!row) return;
+    await this.emit(event, {
+      run: {
+        id: row.public_id,
+        object: "run",
+        flow: row.flow,
+        status: event.slice(4),
+        progress: input.progress,
+        message: input.message,
+        asset_id: input.assetId,
+        error: input.error ?? null
+      }
+    });
+  }
+
+  /** Delivery history, so an integrator can see why nothing arrived. */
+  async listDeliveries(limit = 20): Promise<DeliveryRecord[]> {
+    return this.ctx.storage.sql
+      .exec<DeliveryRow>(
+        `SELECT * FROM deliveries ORDER BY due_at DESC LIMIT ?`,
+        Math.min(Math.max(limit, 1), 100)
+      )
+      .toArray()
+      .map((row) => ({
+        id: row.id,
+        webhookId: row.webhook_id,
+        event: row.event,
+        status: row.status,
+        attempts: row.attempts,
+        lastError: row.last_error
+      }));
   }
 
   async stats(): Promise<{ projects: number; byKind: Record<string, number> }> {

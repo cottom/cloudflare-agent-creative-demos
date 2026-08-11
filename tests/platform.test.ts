@@ -20,6 +20,13 @@ import {
 } from "../src/worker/platform/workflows";
 import { projectObjectName } from "../src/shared/asset-kinds";
 import { artifactKeyBelongsToTenant } from "../src/shared/policy";
+import {
+  generateWebhookSecret,
+  isWebhookEvent,
+  MAX_ATTEMPTS,
+  nextAttemptDelaySeconds,
+  signPayload
+} from "../src/worker/platform/webhooks";
 
 const SECRET = "test-embed-secret";
 
@@ -227,5 +234,59 @@ describe("credential presentation", () => {
 
   it("returns null when no credential is presented", () => {
     expect(bearerToken(request("https://x/v1/whoami"))).toBeNull();
+  });
+});
+
+describe("webhook signing", () => {
+  const SECRET = "whsec_test";
+
+  it("produces a verifiable signature over timestamp and body", async () => {
+    const body = JSON.stringify({ type: "run.succeeded" });
+    const header = await signPayload(SECRET, body, 1_700_000_000);
+    const [timestamp, signature] = header.split(",");
+    expect(timestamp).toBe("t=1700000000");
+    expect(signature?.startsWith("v1=")).toBe(true);
+    // A receiver recomputes over "<t>.<body>"; the same inputs must reproduce it.
+    expect(await signPayload(SECRET, body, 1_700_000_000)).toBe(header);
+  });
+
+  it("changes when the body changes", async () => {
+    const a = await signPayload(SECRET, JSON.stringify({ n: 1 }), 1_700_000_000);
+    const b = await signPayload(SECRET, JSON.stringify({ n: 2 }), 1_700_000_000);
+    expect(a).not.toBe(b);
+  });
+
+  it("changes when the timestamp changes, so a capture cannot be replayed later", async () => {
+    const body = JSON.stringify({ n: 1 });
+    expect(await signPayload(SECRET, body, 1_700_000_000)).not.toBe(
+      await signPayload(SECRET, body, 1_700_000_060)
+    );
+  });
+
+  it("changes with the secret", async () => {
+    const body = JSON.stringify({ n: 1 });
+    expect(await signPayload(SECRET, body, 1_700_000_000)).not.toBe(
+      await signPayload("whsec_other", body, 1_700_000_000)
+    );
+  });
+
+  it("issues a distinct secret each time", () => {
+    expect(generateWebhookSecret()).not.toBe(generateWebhookSecret());
+    expect(generateWebhookSecret().startsWith("whsec_")).toBe(true);
+  });
+});
+
+describe("webhook retry schedule", () => {
+  it("backs off and then gives up rather than retrying forever", () => {
+    const delays = Array.from({ length: MAX_ATTEMPTS }, (_, index) => nextAttemptDelaySeconds(index + 1));
+    expect(delays.at(-1)).toBeNull();
+    const scheduled = delays.filter((value): value is number => value !== null);
+    expect(scheduled).toEqual([...scheduled].sort((a, b) => a - b));
+    expect(scheduled[0]).toBeLessThanOrEqual(30);
+  });
+
+  it("only accepts events it actually emits", () => {
+    expect(isWebhookEvent("run.succeeded")).toBe(true);
+    expect(isWebhookEvent("asset.deleted")).toBe(false);
   });
 });

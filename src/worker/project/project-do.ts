@@ -213,9 +213,10 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
   }
 
   async upsertWorkflow(workflow: WorkflowRun): Promise<WorkflowRun> {
-    return this.ctx.storage.transaction(async (transaction) => {
+    const previousStatus = await this.ctx.storage.transaction(async (transaction) => {
       const state = (await transaction.get<TState>(STATE_KEY)) ?? this.createInitialState(workflow.projectId);
-      const workflows = state.workflows.some((item) => item.id === workflow.id)
+      const existing = state.workflows.find((item) => item.id === workflow.id);
+      const workflows = existing
         ? state.workflows.map((item) => item.id === workflow.id ? workflow : item)
         : [workflow, ...state.workflows];
       const next = {
@@ -224,7 +225,42 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
         updatedAt: new Date().toISOString()
       } as TState;
       await this.putState(transaction, next);
-      return structuredClone(workflow);
+      return existing?.status;
+    });
+
+    // Notify only on a genuine transition. Workflows report progress far more
+    // often than they change state, and a webhook per progress tick would be
+    // noise an integrator has to filter rather than a signal they can act on.
+    if (previousStatus !== workflow.status) {
+      this.ctx.waitUntil(this.notifyRunStatus(workflow).catch((error: unknown) => {
+        console.error(JSON.stringify({
+          event: "run_notify_failed",
+          workflowId: workflow.id,
+          error: error instanceof Error ? error.message : String(error)
+        }));
+      }));
+    }
+    return structuredClone(workflow);
+  }
+
+  /**
+   * Hand a run transition to the workspace that owns it.
+   *
+   * The tenant is recovered from this object's own name. Demo-plane projects
+   * are addressed by a bare id and belong to no workspace, so they have no one
+   * to notify — which is why this returns rather than guessing.
+   */
+  private async notifyRunStatus(workflow: WorkflowRun): Promise<void> {
+    const [tenantId, , assetId] = this.ctx.id.name?.split(":") ?? [];
+    if (!tenantId || !assetId) return;
+    const tenant = this.env.TENANT.get(this.env.TENANT.idFromName(tenantId));
+    await tenant.emitRunEvent({
+      assetId,
+      instanceId: workflow.id,
+      status: workflow.status,
+      progress: workflow.progress,
+      message: workflow.message,
+      error: workflow.error
     });
   }
 

@@ -3,6 +3,7 @@ import { listAssetKinds, projectObjectName, requireAssetKind } from "../../share
 import { canAccessProject, hasScope, signEmbedToken, type Principal, type Scope } from "../platform/auth";
 import { resolvePrincipal } from "../platform/principal";
 import { getWorkflow, listWorkflows, validateWorkflowParams } from "../platform/workflows";
+import { isWebhookEvent, WEBHOOK_EVENTS } from "../platform/webhooks";
 import { StudioAgent, studioAgentName } from "../studio-agent";
 import { ApiProblem, newRequestId, problem } from "./errors";
 import {
@@ -155,6 +156,7 @@ function capabilities(): JsonObject {
       }))
     })),
     scopes: ["projects:read", "projects:write", "agent:chat", "workflows:run"],
+    webhook_events: WEBHOOK_EVENTS,
     limits: { list_page_max: 100, embed_token_max_seconds: 86_400 }
   };
 }
@@ -599,6 +601,100 @@ async function handleRuns(
   throw problem.notFound("This route");
 }
 
+/**
+ * Webhook subscriptions.
+ *
+ * Workspace-level rather than per-asset: an integrator wants one endpoint for
+ * everything happening in their workspace, not one registration per document.
+ */
+async function handleWebhooks(context: Ctx, parts: string[], method: string): Promise<Response> {
+  const { env, principal, requestId } = context;
+  // Managing delivery endpoints is an account-level action, so it is closed to
+  // embed sessions no matter what scopes they were granted.
+  if (principal.via === "embed-token") {
+    throw problem.forbidden("Embed sessions cannot manage webhooks.");
+  }
+  requireScope(principal, "projects:write");
+  const tenant = tenantStub(env, principal.tenantId);
+
+  if (parts.length === 1 && method === "POST") {
+    const body = await readJson<{ url?: string; events?: string[] }>(context.request);
+    const errors: Array<{ field: string; message: string }> = [];
+    let parsed: URL | null = null;
+    try {
+      parsed = body.url ? new URL(body.url) : null;
+    } catch {
+      parsed = null;
+    }
+    if (!parsed) errors.push({ field: "url", message: "url must be an absolute URL" });
+    // Plaintext delivery would put a signed payload — and the receiver's own
+    // data — on the wire in the clear.
+    else if (parsed.protocol !== "https:") errors.push({ field: "url", message: "url must use https" });
+    const events = (body.events ?? []).filter(isWebhookEvent);
+    if (!events.length) {
+      errors.push({ field: "events", message: `events must include at least one of: ${WEBHOOK_EVENTS.join(", ")}` });
+    }
+    if (errors.length) throw problem.validation(errors);
+
+    const record = await tenant.registerWebhook(parsed!.toString(), events);
+    return ok(
+      {
+        id: record.id,
+        object: "webhook",
+        url: record.url,
+        events: record.events,
+        // Shown once. Store it — it is the only way to verify a delivery.
+        secret: record.secret,
+        created_at: record.createdAt
+      },
+      requestId,
+      201
+    );
+  }
+
+  if (parts.length === 1 && method === "GET") {
+    const webhooks = await tenant.listWebhooks();
+    return ok(
+      list(
+        webhooks.map((webhook) => ({
+          id: webhook.id,
+          object: "webhook",
+          url: webhook.url,
+          events: webhook.events,
+          created_at: webhook.createdAt
+        }))
+      ),
+      requestId
+    );
+  }
+
+  if (parts[1] === "deliveries" && method === "GET") {
+    const deliveries = await tenant.listDeliveries(Number(context.url.searchParams.get("limit")) || undefined);
+    return ok(
+      list(
+        deliveries.map((delivery) => ({
+          id: delivery.id,
+          object: "webhook_delivery",
+          webhook_id: delivery.webhookId,
+          event: delivery.event,
+          status: delivery.status,
+          attempts: delivery.attempts,
+          last_error: delivery.lastError
+        }))
+      ),
+      requestId
+    );
+  }
+
+  if (parts.length === 2 && method === "DELETE") {
+    const deleted = await tenant.deleteWebhook(validId(decodeURIComponent(parts[1]!), "webhook id"));
+    if (!deleted) throw problem.notFound(`Webhook ${parts[1]}`);
+    return ok({ id: parts[1], object: "webhook", deleted: true }, requestId);
+  }
+
+  throw problem.notFound("This route");
+}
+
 // ---------------------------------------------------------------------------
 
 /**
@@ -666,6 +762,10 @@ export async function handlePublicApi(
         },
         requestId
       );
+    }
+
+    if (parts[0] === "webhooks") {
+      return await withIdempotency(context, () => handleWebhooks(context, parts, method));
     }
 
     if (parts[0] === "assets") {
