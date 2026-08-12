@@ -83,6 +83,35 @@ abstract class ProjectCore<TState extends ProjectState> extends DurableObject<En
     return initial;
   }
 
+  /**
+   * One round trip for the poll loop.
+   *
+   * Polling used to cost two Durable Object invocations when nothing had
+   * changed — `initialize` to seed the readable project id, then
+   * `getStateVersion` to compare — and three when it had. The `since` check
+   * saved payload but added a call, so an idle client still woke the object
+   * twice a tick. This answers both questions at once, and takes `projectId`
+   * so a first touch still seeds the human-readable id rather than the
+   * object's hex name.
+   */
+  async getSnapshotSince(
+    projectId: string,
+    since?: number
+  ): Promise<{ unchanged: boolean; stateVersion: number; state?: TState }> {
+    const stored = await this.ctx.storage.get<TState>(STATE_KEY);
+    if (!stored) {
+      const initial = this.createInitialState(projectId);
+      await this.ctx.storage.put(STATE_KEY, initial);
+      return { unchanged: false, stateVersion: stateVersionOf(initial), state: structuredClone(initial) };
+    }
+    const state = await this.migrate(stored);
+    const stateVersion = stateVersionOf(state);
+    if (typeof since === "number" && Number.isInteger(since) && stateVersion === since) {
+      return { unchanged: true, stateVersion };
+    }
+    return { unchanged: false, stateVersion, state: structuredClone(state) };
+  }
+
   async getSnapshot(): Promise<TState> {
     return structuredClone(await this.ensureState());
   }

@@ -145,20 +145,27 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
     const kind = parseKind(parts[2]);
     const projectId = decodeURIComponent(parts[3]);
     const projectStub = getProjectStub(env, kind, projectId);
-    await projectStub.initialize(projectId);
 
     if (parts.length === 4 && method === "GET") {
       // Pollers pass ?since=<stateVersion>; skip the full payload when
       // unchanged. This must be stateVersion rather than revision: creating an
       // interaction or advancing a workflow leaves revision alone, and
       // guarding on revision would hide those from the client entirely.
+      //
+      // Answered in a single object invocation — this is the hot path, and it
+      // runs whether or not anyone is looking at the page.
       const since = Number(url.searchParams.get("since"));
-      if (Number.isInteger(since)) {
-        const stateVersion = await projectStub.getStateVersion();
-        if (stateVersion === since) return json({ unchanged: true, stateVersion });
-      }
-      return json(await projectStub.getSnapshot());
+      const result = await projectStub.getSnapshotSince(
+        projectId,
+        Number.isInteger(since) ? since : undefined
+      );
+      if (result.unchanged) return json({ unchanged: true, stateVersion: result.stateVersion });
+      return json(result.state);
     }
+
+    // Write and sub-resource paths still seed explicitly: they fall back to the
+    // object's own name when state is absent, which is not the readable id.
+    await projectStub.initialize(projectId);
     if (parts.length === 5 && parts[4] === "mutate" && method === "POST") {
       const mutation = await readJson<ProjectMutation>(request);
       const result = await projectStub.applyMutation(mutation);
