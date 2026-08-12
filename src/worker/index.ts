@@ -241,6 +241,10 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
         await agent.setEditorAwareness(body.awareness);
         return json({ ok: true });
       }
+      if (parts[6] === "reconcile" && parts.length === 7 && method === "POST") {
+        // Sweeps runs whose terminal transition never arrived.
+        return json(await agent.reconcileWorkflows());
+      }
       if (parts[6] === "clear" && parts.length === 7 && method === "POST") {
         await agent.clearConversation();
         return json({ ok: true, messages: [] });

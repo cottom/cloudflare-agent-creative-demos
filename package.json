@@ -11,7 +11,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "deploy": "pnpm build && wrangler deploy",
+    "deploy": "pnpm typecheck && pnpm build && wrangler deploy",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

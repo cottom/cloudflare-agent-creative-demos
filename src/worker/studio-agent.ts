@@ -434,6 +434,51 @@ export class StudioAgent extends Think<Env> {
     return run(agent as unknown as StudioAgentStub);
   }
 
+  /**
+   * Correct a run whose recorded state no longer matches the engine.
+   *
+   * Terminal transitions are pushed to us by callbacks, so any transition that
+   * does not arrive is simply never recorded — a run terminated while the
+   * object was being replaced stays "running" in the project forever, and the
+   * UI shows a spinner for something that ended days ago. The engine is the
+   * authority on whether a run is still going, so a run that claims to be
+   * live is checked against it.
+   *
+   * Only non-terminal runs are checked: a finished run cannot become unfinished,
+   * and asking about every run would put a status call behind every read.
+   */
+  async reconcileWorkflows(): Promise<{ checked: number; corrected: string[] }> {
+    const config = this.requireConfig();
+    const stub = getProjectStub(this.env, config.kind, config.projectId);
+    const state = (await stub.getSnapshot()) as ProjectState;
+    const live = state.workflows.filter((run) => !["complete", "error", "cancelled"].includes(run.status));
+    const corrected: string[] = [];
+
+    for (const run of live) {
+      const binding: WorkflowBindingName =
+        run.type === "ppt_build" ? "PPT_BUILD_WORKFLOW" : "CANVAS_VARIANTS_WORKFLOW";
+      try {
+        const instance = await this.env[binding].get(run.id);
+        const actual = mapWorkflowStatus(String((await instance.status()).status));
+        if (actual === run.status) continue;
+        if (!["complete", "error", "cancelled"].includes(actual)) continue;
+        await this.recordWorkflow(run.id, run.type, actual, 1, `Reconciled from engine: ${actual}`);
+        corrected.push(run.id);
+      } catch (error) {
+        // An instance the engine no longer knows about is over, whatever it
+        // was. Leaving it "running" is the one answer that is certainly wrong.
+        await this.recordWorkflow(run.id, run.type, "cancelled", 1, "Run is no longer known to the engine");
+        corrected.push(run.id);
+        console.warn(JSON.stringify({
+          event: "workflow_reconcile_missing",
+          workflowId: run.id,
+          error: error instanceof Error ? error.message : String(error)
+        }));
+      }
+    }
+    return { checked: live.length, corrected };
+  }
+
   async cancelWorkflow(instanceId: string, binding: WorkflowBindingName, reason: string) {
     const workflow = this.env[binding];
     const instance = await workflow.get(instanceId);

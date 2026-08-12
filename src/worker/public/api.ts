@@ -595,6 +595,13 @@ async function handleRuns(
   if (parts.length === 4 && method === "GET") {
     requireScope(principal, "projects:read");
     await enforceRateLimit(env, principal, "read");
+    // A run that claims to still be going is checked against the engine, so a
+    // lost terminal callback surfaces as finished instead of spinning forever.
+    // Terminal runs are returned as-is; they cannot become unfinished.
+    if (!["complete", "error", "cancelled"].includes(run.status)) {
+      const agent = await agentFor(env, principal, kind, assetId, run.sessionId);
+      context.ctx.waitUntil(agent.reconcileWorkflows().then(() => undefined).catch(() => {}));
+    }
     return ok(toRun({ ...run, id: runId }, assetId, pending), requestId);
   }
 
