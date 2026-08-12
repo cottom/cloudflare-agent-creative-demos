@@ -181,6 +181,9 @@ async function fillSlideSlots(
       // model struggles with into minutes of wall clock, and a slide that
       // cannot be filled should fall back immediately, not stall the deck.
       maxRetries: 1,
+      // A hung provider call must not consume the whole step's budget. The
+      // slide falls back to its heading, which the downgrade path handles.
+      abortSignal: AbortSignal.timeout(45_000),
       temperature: 0.5,
       prompt: [
         `You are writing the content of one slide in a presentation titled "${plan.title}".`,
@@ -304,14 +307,24 @@ export async function generateDeckPlan(
   /**
    * Second pass: fill each slide's content against its own layout's schema.
    *
-   * Run concurrently because the slides are independent, and the wall clock of
-   * one planning call plus the slowest fill is what the workflow step pays —
-   * not the sum of a dozen sequential calls.
+   * Concurrent, because slides are independent — but bounded. Firing one call
+   * per slide at once pushed a twenty-slide deck past the provider's
+   * concurrency limit, and the whole step then failed with a request timeout
+   * and was retried from the beginning, re-running planning each time. A
+   * bounded window keeps the step's cost proportional to the deck instead of
+   * to the burst it creates.
    */
   const draft = first.object;
-  const filled = await Promise.all(
-    draft.slides.map((slide) => fillSlideSlots(env, draft, slide, options?.diagnostics))
-  );
+  const filled: DeckPlanSlide[] = [];
+  const FILL_CONCURRENCY = 3;
+  for (let index = 0; index < draft.slides.length; index += FILL_CONCURRENCY) {
+    const window = draft.slides.slice(index, index + FILL_CONCURRENCY);
+    filled.push(
+      ...(await Promise.all(
+        window.map((slide) => fillSlideSlots(env, draft, slide, options?.diagnostics))
+      ))
+    );
+  }
   const stillEmpty = filled.filter((slide) => emptyRequiredSlots(slide).length > 0).length;
   if (stillEmpty) {
     console.warn(JSON.stringify({ event: "deck_plan_slots_unfilled", slides: filled.length, stillEmpty }));
